@@ -23,6 +23,7 @@ from gpustack.schemas.benchmark import (
 )
 from gpustack.utils.process import terminate_process_tree, add_signal_handlers
 from gpustack.worker.benchmark.runner import BenchmarkRunner
+from gpustack.worker.direct_process import ensure_benchmark_direct_process_support
 from gpustack.client import ClientSet
 from gpustack.server.bus import Event, EventType
 from gpustack.worker.schemas.benchmark_runner import (
@@ -213,12 +214,14 @@ class BenchmarkManager:
 
         log_file_path = f"{self._benchmark_log_dir}/{benchmark.id}.log"
         try:
-            if os.path.exists(log_file_path):
-                os.remove(log_file_path)
-        except Exception as e:
-            logger.warning(f"Failed to remove old log file {log_file_path}: {e}")
+            ensure_benchmark_direct_process_support(self._config)
 
-        try:
+            try:
+                if os.path.exists(log_file_path):
+                    os.remove(log_file_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove old log file {log_file_path}: {e}")
+
             logger.debug(f"Starting benchmark {benchmark.name}(id={benchmark.id})")
             fallback_registry = registration.determine_default_registry(
                 self._config.system_default_container_registry

@@ -105,6 +105,7 @@ class Config(WorkerConfig, BaseSettings):
         bin_dir: Directory to store additional binaries, e.g., versioned backend executables.
         benchmark_dir: Directory to store benchmark results.
         benchmark_max_duration_seconds: Max duration for a benchmark before timeout. Disabled when unset.
+        direct_process_mode: Enable worker direct-process runtime mode.
         pipx_path: Path to the pipx executable, used to install versioned backends.
         system_reserved: Reserved system resources.
         tools_download_base_url: Base URL to download dependency tools.

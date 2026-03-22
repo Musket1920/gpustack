@@ -12,6 +12,49 @@
 - Only Linux is supported for GPUStack worker nodes. If you use Windows, consider using WSL2 and avoid using Docker Desktop. macOS is not supported for GPUStack worker nodes.
 - Ensure the appropriate GPU drivers and container toolkits are installed for your hardware. See the [Installation Requirements](./requirements.md) for details.
 
+!!! note
+
+    Container deployment is the default and recommended GPUStack installation path.
+
+!!! warning
+
+    This fork adds a direct-process worker mode for a narrow operator workflow. It is not an official upstream GPUStack feature.
+
+## Fork-only direct-process worker mode
+
+Use this mode only when a worker already runs inside a Linux container or directly on a Linux host and you want GPUStack to launch `vLLM` as a direct process instead of creating nested model containers.
+
+Enable it on the worker with `GPUSTACK_DIRECT_PROCESS_MODE=true`.
+
+Supported scope:
+
+- Linux only
+- single-worker only
+- `vLLM` only
+
+Unsupported scope:
+
+- distributed or subordinate-worker serving
+- benchmark direct-process runs
+- non-`vLLM` backends
+
+Host prerequisites for this fork mode:
+
+- `vllm` must already be installed in the worker environment
+- required GPU drivers, runtime libraries, and Python dependencies must already be available on the host or inside the worker container
+- worker-managed directories must be writable
+- localhost ports required by readiness checks must be available
+
+Operator flow for a worker that is already running inside a Linux container:
+
+1. Start the worker with `GPUSTACK_DIRECT_PROCESS_MODE=true`.
+2. Confirm the worker environment can run `vllm serve` before registering the worker.
+3. Register the worker with the GPUStack server through the normal worker startup flow.
+4. Deploy only single-worker `vLLM` models to that worker.
+5. Check `gpustack/logs/serve/<model-instance-id>.log` for launch and runtime logs.
+
+Restart behavior is cleanup-and-recreate only. On worker restart, this fork cleans stale direct-process entries and starts a new process when needed. It does not reattach to an already running serving process.
+
 ## Install GPUStack Server
 
 Run the following command to install and start the GPUStack server using Docker:

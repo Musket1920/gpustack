@@ -61,6 +61,24 @@ For detailed benchmarking methods and results, visit our [Inference Performance 
 3. (Optional) A CPU node for hosting the GPUStack server. The GPUStack server does not require a GPU and can run on a CPU-only machine. [Docker](https://docs.docker.com/engine/install/) must be installed. Docker Desktop (for Windows and macOS) is also supported. If no dedicated CPU node is available, the GPUStack server can be installed on the same machine as a GPU worker node.
 4. Only Linux is supported for GPUStack worker nodes. If you use Windows, consider using WSL2 and avoid using Docker Desktop. macOS is not supported for GPUStack worker nodes.
 
+### Fork-only direct-process note
+
+This fork also includes an experimental worker option for operators who already run the GPUStack worker inside a Linux container or directly on a Linux host and want `vLLM` to start as a direct host process instead of creating nested model containers.
+
+Container deployment remains the default and recommended GPUStack path. Treat direct-process mode as a fork-only operator workflow, not an official upstream GPUStack feature.
+
+Direct-process mode is enabled per worker with `GPUSTACK_DIRECT_PROCESS_MODE=true` and is intentionally narrow:
+
+- Linux worker only
+- single-worker deployments only
+- `vLLM` only
+- no distributed or subordinate-worker serving
+- no benchmark direct-process runs
+
+When this mode is enabled, the worker expects host-side prerequisites that container deployment normally hides, including an available `vllm` executable, the required Python and GPU runtime libraries, writable worker directories, and the localhost ports needed for readiness checks.
+
+Direct-process instances use file logs as the canonical log source at `gpustack/logs/serve/<model-instance-id>.log`. On worker restart, this fork uses a cleanup-and-recreate policy. It kills stale direct-process entries and starts clean instead of trying to reattach to an existing serving process.
+
 ### Install GPUStack
 
 Run the following command to install and start the GPUStack server using Docker:
@@ -131,6 +149,14 @@ Open your browser and navigate to `http://your_host_ip` to access the GPUStack U
 6. Execute the command on the worker node to connect it to the GPUStack server.
 
 7. After the worker node connects successfully, it will appear on the `Workers` page in the GPUStack UI.
+
+Fork-only direct-process workflow for a worker that is already running in a Linux container:
+
+1. Start the worker with `GPUSTACK_DIRECT_PROCESS_MODE=true` in its environment.
+2. Make sure the worker environment already has `vllm` and the required host GPU libraries available.
+3. Keep the worker on the normal container-based registration path so it still connects to the GPUStack server in the usual way.
+4. Deploy only single-worker `vLLM` models on that worker.
+5. Read direct-process serve logs from `gpustack/logs/serve/<model-instance-id>.log` if launch or readiness fails.
 
 ### Deploy a Model
 

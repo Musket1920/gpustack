@@ -86,7 +86,7 @@ class Allocated(AllocationResource):
 
 class WorkerFilter(ABC):
     @abstractmethod
-    def filter(self, workers: List[Worker]) -> Tuple[List[Worker], List[str]]:
+    async def filter(self, workers: List[Worker]) -> Tuple[List[Worker], List[str]]:
         """
         Filter workers suitable for scheduling.
         :return: A tuple containing:

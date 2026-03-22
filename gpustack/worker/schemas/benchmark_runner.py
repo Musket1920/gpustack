@@ -5,7 +5,7 @@
 import json
 import uuid
 from pathlib import Path
-from typing import Generic, Literal, Optional, Self, TypeVar
+from typing import Generic, Literal, Optional, TypeVar
 from pydantic import BaseModel, Field
 
 from gpustack.schemas.benchmark import BenchmarkMetrics
@@ -482,7 +482,7 @@ class GenerativeBenchmarksReport(BaseModel):
         )
 
     @classmethod
-    def load_file(cls, path: str) -> Self:
+    def load_file(cls, path: str) -> "GenerativeBenchmarksReport":
         """
         Load report from JSON or YAML file.
 

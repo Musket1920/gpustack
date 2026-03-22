@@ -24,6 +24,12 @@ The GPUStack worker consists of the following components:
 - **Serving Manager:** Manages the lifecycle of model instances on the worker.
 - **Metric Exporter:** Exports metrics about the model instances and their performance.
 
+Container deployment is the standard GPUStack worker architecture. In this fork only, a worker can also be started with `GPUSTACK_DIRECT_PROCESS_MODE=true` to launch `vLLM` as a direct Linux process instead of creating a model container.
+
+That direct-process path is intentionally limited to Linux, single-worker, `vLLM`-only serving. It does not support distributed followers, subordinate workers, benchmark runs, or non-`vLLM` backends.
+
+The fork keeps the same worker control flow, but direct-process instances use file logs at `gpustack/logs/serve/<model-instance-id>.log` and follow a cleanup-and-recreate restart policy. On worker restart, stale direct-process entries are removed and recreated instead of being reattached.
+
 ### AI Gateway
 
 The AI Gateway handles incoming API requests from clients. It routes requests to the appropriate model instances based on the requested model. GPUStack uses [Higress](https://github.com/alibaba/higress) for API routing and load balancing.

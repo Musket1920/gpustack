@@ -1,8 +1,31 @@
 import asyncio
+import importlib
+import sys
 from typing import List, Union
+import types
 import pytest
 
-from gpustack.worker.logs import LogOptions, log_generator
+def _import_with_fcntl_stub(module_name: str):
+    fcntl_stub = types.ModuleType("fcntl")
+    setattr(fcntl_stub, "LOCK_EX", 1)
+    setattr(fcntl_stub, "LOCK_UN", 2)
+    setattr(fcntl_stub, "lockf", lambda *args, **kwargs: None)
+    setattr(fcntl_stub, "flock", lambda *args, **kwargs: None)
+    original_fcntl = sys.modules.get("fcntl")
+    sys.modules["fcntl"] = fcntl_stub
+    try:
+        return importlib.import_module(module_name)
+    finally:
+        if original_fcntl is None:
+            sys.modules.pop("fcntl", None)
+        else:
+            sys.modules["fcntl"] = original_fcntl
+
+
+route_logs = _import_with_fcntl_stub("gpustack.routes.worker.logs")
+worker_logs = _import_with_fcntl_stub("gpustack.worker.logs")
+LogOptions = worker_logs.LogOptions
+log_generator = worker_logs.log_generator
 
 
 @pytest.fixture
@@ -127,3 +150,68 @@ async def test_log_generator_tail_larger_than_large_file(large_log_file):
         [line async for line in log_generator(log_path, options)]
     )
     assert result == ["line" * 256 + "\n", "line" * 256 + "\n"]
+
+
+@pytest.mark.asyncio
+async def test_direct_process_logs_stream_files_only(monkeypatch, tmp_path):
+    log_file = tmp_path / "serve.log"
+    log_file.write_text("line1\n", encoding="utf-8")
+    container_calls: list[dict] = []
+
+    def record_logs_workload(**kwargs):
+        container_calls.append(kwargs)
+        return "container should not be read"
+
+    monkeypatch.setattr(route_logs, "logs_workload", record_logs_workload)
+
+    generator = route_logs.combined_log_generator(
+        str(log_file),
+        "",
+        LogOptions(follow=True),
+        "test-instance",
+        file_log_exists=True,
+        file_only=True,
+    )
+
+    first_line = await asyncio.wait_for(generator.__anext__(), timeout=1)
+    assert normalize_newlines(first_line) == "line1\n"
+
+    with open(log_file, "a", encoding="utf-8") as handle:
+        handle.write("line2\n")
+
+    second_line = await asyncio.wait_for(generator.__anext__(), timeout=1)
+    assert normalize_newlines(second_line) == "line2\n"
+    assert container_calls == []
+
+
+@pytest.mark.asyncio
+async def test_container_mode_logs_still_probe_container_stream(monkeypatch, tmp_path):
+    log_file = tmp_path / "serve.log"
+    log_file.write_text("file-line\n", encoding="utf-8")
+    container_calls: list[dict] = []
+
+    def fake_logs_workload(**kwargs):
+        container_calls.append(kwargs)
+        return "container-line\n"
+
+    monkeypatch.setattr(route_logs, "logs_workload", fake_logs_workload)
+
+    result = normalize_newlines(
+        [
+            line
+            async for line in route_logs.combined_log_generator(
+                str(log_file),
+                "",
+                LogOptions(follow=False),
+                "test-instance",
+                file_log_exists=True,
+                file_only=False,
+            )
+        ]
+    )
+
+    assert result == ["file-line\n", "container-line\n"]
+    assert container_calls == [
+        {"name": "test-instance", "tail": 1, "follow": False},
+        {"name": "test-instance", "tail": -1, "follow": False},
+    ]

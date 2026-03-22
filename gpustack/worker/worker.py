@@ -241,6 +241,7 @@ class Worker:
         self._register()
         self._config.reload_worker_config(self._default_config)
         self.log_worker_config()
+        self._serve_manager.reconcile_stale_direct_process_registry()
         if self._exporter_enabled:
             # Start the runtime metrics cacher.
             _runtime_metrics_aggregator = RuntimeMetricsAggregator(
@@ -301,11 +302,14 @@ class Worker:
         if get_resource_injection_policy() == "kdp":
             self._create_async_task(kdp_serve_async(stop_event=asyncio.Event()))
 
-        # wait for a while to let other tasks start
-        await asyncio.sleep(0.5)
-        logger.info("GPUStack worker startup completed.")
+        try:
+            # wait for a while to let other tasks start
+            await asyncio.sleep(0.5)
+            logger.info("GPUStack worker startup completed.")
 
-        await asyncio.gather(*self._async_tasks)
+            await asyncio.gather(*self._async_tasks)
+        finally:
+            self._serve_manager.reconcile_stale_direct_process_registry()
 
     async def _serve_apis(self):
         """

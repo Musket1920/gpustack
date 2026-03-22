@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 from tenacity import RetryError
-from typing import Optional
+from typing import AsyncGenerator, Optional, cast
 
 from fastapi import APIRouter, Request, Query
 from fastapi.responses import StreamingResponse
@@ -139,7 +139,7 @@ async def merge_async_generators(
                 gen = pending_tasks.pop(task)
                 try:
                     result = task.result()
-                    yield result
+                    yield str(result)
                     if not preempting:
                         new_task = asyncio.create_task(gen.__anext__())
                         pending_tasks[new_task] = gen
@@ -306,6 +306,7 @@ async def combined_log_generator(
     options: LogOptionsDep,
     model_instance_name: str,
     file_log_exists: bool = True,
+    file_only: bool = False,
 ):
     """Unified log streaming across three startup phases.
 
@@ -333,7 +334,22 @@ async def combined_log_generator(
     """
 
     # Phase 1: file logs (download + main) merged together
-    file_tasks = []
+    file_tasks: list[AsyncGenerator[str, None]] = []
+
+    # Direct-process instances use serve log files as the canonical source.
+    if download_log_path and Path(download_log_path).exists():
+        file_tasks.append(log_generator(download_log_path, options))
+
+    if file_log_exists:
+        file_tasks.append(log_generator(main_log_path, options))
+
+    if file_only:
+        if not file_tasks:
+            raise NotFoundException(message="Log file not found")  # type: ignore[call-arg]
+
+        async for line in merge_async_generators(*file_tasks):
+            yield line
+        return
 
     # Decide how to handle file logs based on whether container logs are already available
     file_options = options
@@ -350,6 +366,7 @@ async def combined_log_generator(
         file_options = options
 
     # Add download log if needed and file exists
+    file_tasks = []
     if download_log_path and Path(download_log_path).exists():
         file_tasks.append(log_generator(download_log_path, file_options))
 
@@ -360,7 +377,7 @@ async def combined_log_generator(
     if (
         not file_tasks and not container_ready
     ):  # No download/main logs and no container logs
-        raise NotFoundException(message="Log file not found")
+        raise NotFoundException(message="Log file not found")  # type: ignore[call-arg]
 
     # If following and container not yet ready, allow interleaved streaming of file logs,
     # but preempt as soon as container produces any output.
@@ -410,12 +427,18 @@ async def get_serve_logs(
 
     # show_download_logs parameter is passed from server based on model instance state
     return StreamingResponse(
-        combined_log_generator(
-            str(main_log_path),
-            str(download_log_path),
-            log_options,
-            model_instance_name,
-            file_log_exists,
+        cast(
+            AsyncGenerator[str, None],
+            combined_log_generator(
+                str(main_log_path),
+                str(download_log_path),
+                log_options,
+                model_instance_name,
+                file_log_exists,
+                file_only=bool(
+                    getattr(request.app.state.config, "direct_process_mode", False)
+                ),
+            ),
         ),
         media_type="application/octet-stream",
     )
@@ -439,12 +462,15 @@ async def get_benchmark_logs(
         file_log_exists = False
 
     return StreamingResponse(
-        combined_log_generator(
-            str(main_log_path),
-            "",
-            log_options,
-            benchmark_name,
-            file_log_exists,
+        cast(
+            AsyncGenerator[str, None],
+            combined_log_generator(
+                str(main_log_path),
+                "",
+                log_options,
+                benchmark_name,
+                file_log_exists,
+            ),
         ),
         media_type="application/octet-stream",
     )

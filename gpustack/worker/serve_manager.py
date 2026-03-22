@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 from datetime import datetime, timezone
 import multiprocessing
+import signal
 import threading
 
 import requests
@@ -34,6 +35,17 @@ from gpustack.worker.backends.vllm import VLLMServer
 from gpustack.worker.backends.vox_box import VoxBoxServer
 from gpustack.worker.backends.custom import CustomServer
 from gpustack.worker.model_meta import get_meta_from_running_instance
+from gpustack.worker.direct_process import (
+    ensure_model_instance_direct_process_support,
+)
+from gpustack.worker.process_registry import (
+    DIRECT_PROCESS_RUNTIME_MODE,
+    DirectProcessEntryStatus,
+    DirectProcessRegistry,
+    DirectProcessRegistryEntry,
+    DirectProcessStateTransition,
+    map_direct_process_state_transition,
+)
 from gpustack.client import ClientSet
 from gpustack.schemas.models import (
     BackendEnum,
@@ -108,6 +120,7 @@ class ServeManager:
     Used to avoid redundant API calls to get model information.
     """
     _model_instance_by_instance_id: Dict[int, ModelInstance] = {}
+    _direct_process_registry: Optional[DirectProcessRegistry] = None
 
     _clientset_getter: Callable[[], ClientSet]
     _worker_id_getter: Callable[[], int]
@@ -125,6 +138,7 @@ class ServeManager:
 
         # Instance-level port tracking to avoid conflicts
         self._assigned_ports: Dict[int, Set[int]] = {}
+        self._direct_process_registry = DirectProcessRegistry(cfg)
 
         os.makedirs(self._serve_log_dir, exist_ok=True)
 
@@ -200,7 +214,7 @@ class ServeManager:
         model_instances_page = self._clientset.model_instances.list()
         if not model_instances_page.items:
             return
-        model_instances: List[ModelInstance] = []
+        model_instances = []
         for model_instance in model_instances_page.items:
             # if the model instance is assigned to this worker, it must be scheduled.
             # But we don't need to sync the scheduled model when it is not initialized yet.
@@ -224,6 +238,10 @@ class ServeManager:
                 logger.trace(
                     f"Model instance {model_instance.name} is provisioning. Skipping sync."
                 )
+                continue
+
+            if self._is_direct_process_mode():
+                self._sync_direct_process_model_instance(model_instance)
                 continue
 
             # Skip if the workload is still launching.
@@ -386,6 +404,7 @@ class ServeManager:
         worker_id: int,
         inference_backend: InferenceBackend,
         fallback_registry: Optional[str] = None,
+        direct_process_registry_path: Optional[str] = None,
     ):
         """
         Serve model instance in a subprocess.
@@ -423,7 +442,16 @@ class ServeManager:
                         fallback_registry,
                     )
                     logger.info(f"Provisioning model instance {mi.name}")
-                    server_ins.start()
+                    start_result = server_ins.start()
+                    if direct_process_registry_path:
+                        ServeManager._record_direct_process_runtime(
+                            registry_path=direct_process_registry_path,
+                            mi=mi,
+                            worker_id=worker_id,
+                            backend=backend,
+                            log_file_path=log_file_path,
+                            start_result=start_result,
+                        )
                     logger.info(f"Finished provisioning model instance {mi.name}")
                 except Exception as e:
                     logger.exception(
@@ -539,8 +567,7 @@ class ServeManager:
 
             # Start on subordinate worker if not started yet.
             if not is_main_worker:
-                workload = get_workload(mi.name)
-                if not workload:
+                if self._should_start_model_instance(mi):
                     self._start_model_instance(mi)
                     logger.trace(
                         f"UPDATED event: started model instance {mi.name} on subordinate worker."
@@ -569,6 +596,9 @@ class ServeManager:
             logger.warning(f"Model instance {mi.name} is provisioning. Skipping start.")
             return
 
+        model = self._get_model(mi)
+        backend = get_backend(model)
+
         is_main_worker = mi.worker_id == self._worker_id
 
         log_file_path = f"{self._serve_log_dir}/{mi.id}.log"
@@ -590,8 +620,15 @@ class ServeManager:
             sw = mi.distributed_servers.subordinate_workers[sw_pos]
 
         try:
-            model = self._get_model(mi)
-            backend = get_backend(model)
+            ensure_model_instance_direct_process_support(
+                self._config,
+                mi,
+                backend,
+                self._worker_id,
+            )
+
+            if self._is_direct_process_mode():
+                self._get_direct_process_registry().remove_by_model_instance_id(mi.id)
 
             self._assign_ports(mi, model, backend)
 
@@ -619,6 +656,11 @@ class ServeManager:
                     self._worker_id,
                     self._inference_backend_manager.get_backend_by_name(backend),
                     fallback_registry,
+                    (
+                        str(self._get_direct_process_registry().path)
+                        if self._is_direct_process_mode()
+                        else None
+                    ),
                 ),
             )
             process.daemon = False
@@ -631,8 +673,11 @@ class ServeManager:
                     "state": ModelInstanceStateEnum.INITIALIZING,
                     "port": mi.port,
                     "ports": mi.ports,
-                    "pid": process.pid,
                 }
+                if not self._is_direct_process_mode():
+                    patch_dict["pid"] = process.pid
+                else:
+                    patch_dict["pid"] = None
             # Get patch dict for subordinate worker.
             else:
                 sw.state = ModelInstanceStateEnum.INITIALIZING
@@ -643,7 +688,7 @@ class ServeManager:
                     == DistributedServerCoordinateModeEnum.INITIALIZE_LATER
                 ):
                     sw.state = ModelInstanceStateEnum.RUNNING
-                sw.pid = process.pid
+                sw.pid = None if self._is_direct_process_mode() else process.pid
                 patch_dict = {
                     f"distributed_servers.subordinate_workers.{sw_pos}": sw,
                 }
@@ -813,10 +858,16 @@ class ServeManager:
         if self._is_provisioning(mi):
             terminate_process_tree(self._provisioning_processes[mi.id].pid)
 
-        # Delete workload.
-        deployment_metadata = mi.get_deployment_metadata(self._worker_id)
-        if deployment_metadata:
-            delete_workload(deployment_metadata.name)
+        if self._is_direct_process_mode():
+            direct_process_entry = self._get_direct_process_registry().remove_by_model_instance_id(
+                mi.id
+            )
+            self._terminate_direct_process_entry(direct_process_entry)
+        else:
+            # Delete workload.
+            deployment_metadata = mi.get_deployment_metadata(self._worker_id)
+            if deployment_metadata:
+                delete_workload(deployment_metadata.name)
 
         # Cleanup internal states.
         self._provisioning_processes.pop(mi.id, None)
@@ -826,6 +877,29 @@ class ServeManager:
         self._model_instance_by_instance_id.pop(mi.id, None)
 
         logger.info(f"Stopped model instance {mi.name or mi.id}")
+
+    def reconcile_stale_direct_process_registry(self) -> None:
+        if not self._is_direct_process_mode():
+            return
+
+        registry = self._get_direct_process_registry()
+        entries = registry.list_entries()
+        if not entries:
+            return
+
+        logger.info(
+            "Reconciling %s direct-process registry entries with cleanup-and-recreate policy.",
+            len(entries),
+        )
+        for entry in entries:
+            status = registry.inspect_by_model_instance_id(entry.model_instance_id)
+            logger.info(
+                "Cleaning direct-process registry entry for %s (%s).",
+                entry.deployment_name,
+                status.reason or status.status.value,
+            )
+            removed_entry = registry.remove_by_model_instance_id(entry.model_instance_id)
+            self._terminate_direct_process_entry(removed_entry or entry)
 
     def _restart_error_model_instance(self, mi: ModelInstance):
         """
@@ -913,6 +987,211 @@ class ServeManager:
                 process.join(timeout=0)
                 return process.is_alive()
         return False
+
+    def _is_direct_process_mode(self) -> bool:
+        return bool(getattr(self._config, "direct_process_mode", False))
+
+    def _get_direct_process_registry(self) -> DirectProcessRegistry:
+        registry = getattr(self, "_direct_process_registry", None)
+        if registry is None:
+            registry = DirectProcessRegistry(self._config)
+            self._direct_process_registry = registry
+        return registry
+
+    def _should_start_model_instance(self, mi: ModelInstance) -> bool:
+        if not self._is_direct_process_mode():
+            workload = get_workload(mi.name)
+            return workload is None
+
+        status = self._get_direct_process_registry().inspect_by_model_instance_id(mi.id)
+        return status.status != DirectProcessEntryStatus.LIVE
+
+    def _sync_direct_process_model_instance(self, model_instance: ModelInstance):
+        is_main_worker = model_instance.worker_id == self._worker_id
+        status = self._get_direct_process_registry().inspect_by_model_instance_id(
+            model_instance.id
+        )
+        entry = status.entry
+
+        model = self._get_model(model_instance)
+        if not model.backend_version:
+            model = self._refresh_model(model_instance)
+
+        backend = get_backend(model)
+        health_check_path = self._get_health_check_path(backend)
+        if model.env and "GPUSTACK_MODEL_HEALTH_CHECK_PATH" in model.env:
+            health_check_path = model.env["GPUSTACK_MODEL_HEALTH_CHECK_PATH"]
+
+        ready = False
+        if status.status == DirectProcessEntryStatus.LIVE:
+            ready = is_ready(backend, model_instance, health_check_path, model)
+
+        transition = map_direct_process_state_transition(
+            model_instance.state,
+            status,
+            is_ready=ready,
+        )
+
+        with contextlib.suppress(NotFoundException):
+            if is_main_worker:
+                patch_dict = self._build_direct_process_main_worker_patch(
+                    model_instance=model_instance,
+                    entry=entry,
+                    transition_ready=ready,
+                    transition_status=transition,
+                    model=model,
+                    backend=backend,
+                )
+            else:
+                patch_dict = self._build_direct_process_subordinate_patch(
+                    model_instance=model_instance,
+                    entry=entry,
+                    transition_status=transition,
+                )
+
+            if patch_dict:
+                self._update_model_instance(model_instance.id, **patch_dict)
+
+    def _build_direct_process_main_worker_patch(
+        self,
+        model_instance: ModelInstance,
+        entry: Optional[DirectProcessRegistryEntry],
+        transition_ready: bool,
+        transition_status: DirectProcessStateTransition,
+        model: Model,
+        backend: BackendEnum,
+    ) -> Dict[str, object]:
+        patch_dict: Dict[str, object] = {}
+
+        if entry and model_instance.pid != entry.pid:
+            patch_dict["pid"] = entry.pid
+
+        if transition_status.next_state == ModelInstanceStateEnum.RUNNING:
+            patch_dict.update(
+                {
+                    "state": ModelInstanceStateEnum.RUNNING,
+                    "restart_count": 0,
+                    "state_message": "",
+                }
+            )
+
+            meta = get_meta_from_running_instance(model_instance, backend, model)
+            if meta:
+                merged_meta = dict(model.meta or {})
+                merged_meta.update(meta)
+                if merged_meta != model.meta:
+                    self._update_model(model.id, meta=merged_meta)
+        elif transition_status.next_state == ModelInstanceStateEnum.ERROR:
+            patch_dict.update(
+                {
+                    "state": ModelInstanceStateEnum.ERROR,
+                    "state_message": transition_status.state_message or "",
+                }
+            )
+        elif transition_status.next_state == ModelInstanceStateEnum.STARTING:
+            patch_dict.update(
+                {
+                    "state": ModelInstanceStateEnum.STARTING,
+                    "state_message": transition_status.state_message or "",
+                }
+            )
+
+        if not transition_ready and transition_status.next_state is None and not patch_dict:
+            return {}
+
+        return patch_dict
+
+    def _build_direct_process_subordinate_patch(
+        self,
+        model_instance: ModelInstance,
+        entry: Optional[DirectProcessRegistryEntry],
+        transition_status: DirectProcessStateTransition,
+    ) -> Dict[str, object]:
+        if not model_instance.distributed_servers:
+            return {}
+
+        subordinate_workers = (
+            model_instance.distributed_servers.subordinate_workers or []
+        )
+
+        sw_pos = next(
+            (
+                i
+                for i, sw in enumerate(subordinate_workers)
+                if sw.worker_id == self._worker_id
+            ),
+            None,
+        )
+        if sw_pos is None:
+            return {}
+
+        sw = subordinate_workers[sw_pos]
+        if entry and sw.pid != entry.pid:
+            sw.pid = entry.pid
+
+        if transition_status.next_state == ModelInstanceStateEnum.RUNNING:
+            sw.state = ModelInstanceStateEnum.RUNNING
+            sw.state_message = ""
+        elif transition_status.next_state == ModelInstanceStateEnum.ERROR:
+            sw.state = ModelInstanceStateEnum.ERROR
+            sw.state_message = transition_status.state_message or ""
+        elif transition_status.next_state == ModelInstanceStateEnum.STARTING:
+            sw.state = ModelInstanceStateEnum.STARTING
+            sw.state_message = transition_status.state_message or ""
+        else:
+            return {}
+
+        return {f"distributed_servers.subordinate_workers.{sw_pos}": sw}
+
+    def _terminate_direct_process_entry(
+        self, entry: Optional[DirectProcessRegistryEntry]
+    ) -> None:
+        if entry is None:
+            return
+
+        killpg = getattr(os, "killpg", None)
+        if (
+            entry.process_group_id is not None
+            and platform.system() != "windows"
+            and killpg is not None
+        ):
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                killpg(entry.process_group_id, signal.SIGTERM)
+
+        terminate_process_tree(entry.pid)
+
+    @staticmethod
+    def _record_direct_process_runtime(
+        registry_path: str,
+        mi: ModelInstance,
+        worker_id: int,
+        backend: BackendEnum,
+        log_file_path: str,
+        start_result,
+    ) -> None:
+        if not isinstance(start_result, dict):
+            return
+
+        pid = start_result.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return
+
+        deployment_metadata = mi.get_deployment_metadata(worker_id)
+        deployment_name = deployment_metadata.name if deployment_metadata else mi.name
+        port = start_result.get("port") or mi.port
+        if port is None:
+            return
+
+        DirectProcessRegistry(registry_path).upsert(
+            model_instance_id=mi.id,
+            deployment_name=deployment_name,
+            pid=pid,
+            process_group_id=start_result.get("process_group_id"),
+            port=port,
+            log_path=start_result.get("log_path") or log_file_path,
+            backend=backend,
+            mode=start_result.get("mode") or DIRECT_PROCESS_RUNTIME_MODE,
+        )
 
     def _get_health_check_path(self, backend: str) -> Optional[str]:
         """

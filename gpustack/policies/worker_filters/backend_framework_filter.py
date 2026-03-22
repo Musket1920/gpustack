@@ -1,6 +1,9 @@
 import logging
-from typing import List, Tuple, Optional
+from typing import Any, List, Tuple, Optional
 
+from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
+    VLLMResourceFitSelector,
+)
 from gpustack.policies.base import WorkerFilter
 from gpustack.schemas.models import Model, get_backend, BackendEnum
 from gpustack.schemas.workers import Worker
@@ -16,6 +19,14 @@ from gpustack_runtime.detector import ManufacturerEnum
 
 logger = logging.getLogger(__name__)
 
+DIRECT_PROCESS_MODE_UNSUPPORTED_PLATFORM_MESSAGE = (
+    "Direct process mode is supported only on Linux workers."
+)
+DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_MESSAGE = (
+    "Direct process mode supports only single-worker launches; distributed workers are not supported."
+)
+DIRECT_PROCESS_MODE_LABEL = "gpustack.direct-process-mode"
+
 
 class BackendFrameworkFilter(WorkerFilter):
     """
@@ -26,6 +37,68 @@ class BackendFrameworkFilter(WorkerFilter):
     def __init__(self, model: Model):
         self.model = model
         self.backend_name = get_backend(model)
+
+    def _is_direct_process_worker(self, worker: Worker) -> bool:
+        if not worker.labels:
+            return False
+
+        label_value = worker.labels.get(DIRECT_PROCESS_MODE_LABEL)
+        if label_value is None:
+            return False
+
+        return str(label_value).lower() in {"1", "true", "yes", "on"}
+
+    def _get_worker_platform_name(self, worker: Worker) -> str:
+        worker_platform = None
+        if worker.status and worker.status.os:
+            worker_platform = worker.status.os.name
+        if not worker_platform and worker.labels:
+            worker_platform = worker.labels.get("os")
+        if worker_platform:
+            return worker_platform.lower()
+        return ""
+
+    def _get_worker_gpu_count(self, worker: Worker) -> int:
+        if not worker.status or not worker.status.gpu_devices:
+            return 0
+        return len(worker.status.gpu_devices)
+
+    def _get_direct_process_incompatible_reason(
+        self, worker: Worker
+    ) -> Optional[str]:
+        if self.backend_name != BackendEnum.VLLM:
+            return (
+                f"Direct process mode supports only the vLLM backend, got '{self.backend_name}'."
+            )
+
+        if self._get_worker_platform_name(worker) != "linux":
+            return DIRECT_PROCESS_MODE_UNSUPPORTED_PLATFORM_MESSAGE
+
+        requested_world_size, _ = (
+            VLLMResourceFitSelector.get_world_size_from_backend_parameters(self.model)
+        )
+        if requested_world_size and self._get_worker_gpu_count(worker) < requested_world_size:
+            return DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_MESSAGE
+
+        return None
+
+    async def _filter_direct_process_workers(
+        self, workers: List[Worker]
+    ) -> Tuple[List[Worker], List[str]]:
+        filtered_workers = []
+        filtered_messages = []
+
+        for worker in workers:
+            incompatible_reason = self._get_direct_process_incompatible_reason(worker)
+            if incompatible_reason:
+                filtered_messages.append(
+                    f"Worker {worker.name} filtered out: {incompatible_reason}"
+                )
+                continue
+
+            filtered_workers.append(worker)
+
+        return filtered_workers, filtered_messages
 
     def _get_gpu_query_conditions(
         self, worker: Worker
@@ -44,7 +117,9 @@ class BackendFrameworkFilter(WorkerFilter):
             for gpu in worker.status.gpu_devices:
                 variant = None
                 if gpu.vendor == ManufacturerEnum.ASCEND and gpu.arch_family:
-                    variant = get_ascend_cann_variant(gpu.arch_family).lower()
+                    cann_variant = get_ascend_cann_variant(gpu.arch_family)
+                    if cann_variant:
+                        variant = str(cann_variant).lower()
                 query_conditions.add(
                     (gpu.type, gpu.runtime_version, self.model.backend_version, variant)
                 )
@@ -58,13 +133,14 @@ class BackendFrameworkFilter(WorkerFilter):
             kwargs.pop("backend_version")
         # Since backend versions are backward compatible,
         # if an exact version match cannot be found, we can try to see if a lower version is available.
-        runners_list = list_service_runners(**kwargs)
+        runners_list: List[Any] = list_service_runners(**kwargs)
         supported_runtime_versions = []
         for runner in runners_list:
-            if not runner.versions or len(runner.versions) == 0:
+            runner_versions: Any = getattr(runner, "versions", None)
+            if not runner_versions:
                 continue
             try:
-                runner_version = runner.versions[0].backends[0].versions[0].version
+                runner_version = runner_versions[0].backends[0].versions[0].version
                 if compare_versions(runner_version, backend_version) <= 0:
                     return True, []
                 supported_runtime_versions.append(runner_version)
@@ -119,7 +195,7 @@ class BackendFrameworkFilter(WorkerFilter):
                 if is_custom_supported or is_built_in_supported:
                     return True, []
 
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "backend": gpu_type,
             "service": self.backend_name.lower(),
         }
@@ -159,19 +235,41 @@ class BackendFrameworkFilter(WorkerFilter):
             )
             return workers, []
 
+        direct_process_workers = [
+            worker for worker in workers if self._is_direct_process_worker(worker)
+        ]
+        standard_workers = [
+            worker for worker in workers if not self._is_direct_process_worker(worker)
+        ]
+
+        filtered_worker_set = set()
+        filtered_messages = []
+
+        if direct_process_workers:
+            direct_filtered_workers, direct_filtered_messages = (
+                await self._filter_direct_process_workers(direct_process_workers)
+            )
+            filtered_worker_set.update(direct_filtered_workers)
+            filtered_messages.extend(direct_filtered_messages)
+
+        if not standard_workers:
+            filtered_workers = [worker for worker in workers if worker in filtered_worker_set]
+            return filtered_workers, filtered_messages
+
         if self.model.backend == BackendEnum.CUSTOM:
-            return workers, []
+            filtered_worker_set.update(standard_workers)
+            filtered_workers = [worker for worker in workers if worker in filtered_worker_set]
+            return filtered_workers, filtered_messages
 
         async with async_session() as session:
-            inference_backends = await InferenceBackend.all(session)
-
-        filtered_workers = []
-        filtered_messages = []
+            inference_backends: List[InferenceBackend] = list(
+                await InferenceBackend.all(session)
+            )
 
         # Check if model has specified backend_version
         has_backend_version = self.model.backend_version is not None
 
-        for worker in workers:
+        for worker in standard_workers:
             # Get and deduplicate query conditions from worker's GPU devices
             query_conditions = self._get_gpu_query_conditions(worker)
 
@@ -225,10 +323,12 @@ class BackendFrameworkFilter(WorkerFilter):
                         incompatible_reasons.append(reason_text)
 
             if is_compatible:
-                filtered_workers.append(worker)
+                filtered_worker_set.add(worker)
             else:
                 reason = "; ".join(incompatible_reasons)
                 filtered_messages.append(f"Worker {worker.name} filtered out: {reason}")
+
+        filtered_workers = [worker for worker in workers if worker in filtered_worker_set]
 
         if filtered_messages:
             logger.info(
