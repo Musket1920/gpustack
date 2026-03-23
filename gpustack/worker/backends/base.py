@@ -895,6 +895,105 @@ $@
         """
         return transform_workload_plan(self._config, workload, self._fallback_registry)
 
+    # ------------------------------------------------------------------
+    # Shared direct-process runtime contract
+    #
+    # Backends that support direct-process mode override these methods.
+    # The default implementations return False / raise, so container-mode
+    # backends are completely unaffected.
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def supports_direct_process(cls) -> bool:
+        """Whether this backend supports single-worker direct-process mode.
+
+        Override in subclasses that can launch as a host process instead of
+        a container workload.  The gatekeeper in ``direct_process.py`` calls
+        this at scheduling time (before an instance is created) to decide
+        whether a backend/mode combination is valid.
+        """
+        return False
+
+    @classmethod
+    def supports_distributed_direct_process(cls) -> bool:
+        """Whether this backend supports multi-worker distributed direct-process.
+
+        Only ``vLLM`` is expected to return ``True`` in Part 2.
+        """
+        return False
+
+    def build_direct_process_command(
+        self,
+        port: int,
+    ) -> List[str]:
+        """Build the argv list for a direct-process launch.
+
+        Subclasses that set ``supports_direct_process() == True`` must
+        override this to return the full command (e.g. ``["vllm", "serve",
+        "/path/to/model", ...]``).
+
+        Raises:
+            NotImplementedError: if the backend has not implemented
+                direct-process support.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement build_direct_process_command"
+        )
+
+    def build_direct_process_env(self) -> Dict[str, str]:
+        """Build the environment dict for a direct-process launch.
+
+        The default implementation returns the configured env from the base
+        class.  Backends may override to add backend-specific variables.
+        """
+        return self._get_configured_env()
+
+    def get_direct_process_health_path(self) -> str:
+        """Return the HTTP health-check path used for readiness probes.
+
+        Defaults to ``/v1/models`` which is the convention for vLLM / SGLang
+        built-in backends.
+        """
+        return "/v1/models"
+
+    def preflight_direct_process(
+        self,
+        command_args: List[str],
+        env: Dict[str, str],
+        port: int,
+    ) -> None:
+        """Run host-side prerequisite checks before spawning a direct process.
+
+        The default implementation is a no-op.  Backends should override to
+        verify that the executable exists, required directories are writable,
+        and the serving port is bindable.
+
+        Raises:
+            RuntimeError: if any prerequisite check fails.
+        """
+
+    def start_direct_process(
+        self,
+    ):
+        """Orchestrate a full direct-process launch cycle.
+
+        This is the high-level entry point called from ``_start()`` when
+        ``direct_process_mode`` is enabled.  The default implementation
+        delegates to the shared helpers:
+
+        1. ``build_direct_process_command``
+        2. ``build_direct_process_env``
+        3. ``preflight_direct_process``
+        4. spawn the process
+        5. return ``{pid, process_group_id, port, mode}``
+
+        Subclasses may override for backend-specific orchestration (e.g.
+        distributed validation) but **must** return the same dict shape.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement start_direct_process"
+        )
+
 
 def _get_service_version_from_versioned_runner(
     backend_versioned_runner: BackendVersionedRunner,
