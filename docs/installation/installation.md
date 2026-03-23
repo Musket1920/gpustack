@@ -22,25 +22,36 @@
 
 ## Fork-only direct-process worker mode
 
-Use this mode only when a worker already runs inside a Linux container or directly on a Linux host and you want GPUStack to launch `vLLM` as a direct process instead of creating nested model containers.
+Use this mode only when a worker already runs inside a Linux container or directly on a Linux host and you want GPUStack to launch model servers as direct processes instead of creating nested model containers.
 
 Enable it on the worker with `GPUSTACK_DIRECT_PROCESS_MODE=true`.
 
-Supported scope:
+Container deployment is still supported and remains the default path. This direct-process mode is fork-only, and the runtime choice stays worker-global for now. A worker runs in container mode or direct-process mode, not both at once.
+
+Supported scope in Part 2:
 
 - Linux only
-- single-worker only
-- `vLLM` only
+- single-worker direct-process for built-in `vLLM`, `SGLang`, `MindIE`, and `VoxBox`
+- single-worker direct-process for first-class `llama.cpp`
+- generic `custom backend` direct-process for community backends that fit the documented contract
+- distributed direct-process for `vLLM` only
 
 Unsupported scope:
 
-- distributed or subordinate-worker serving
+- non-`vLLM` distributed direct-process
 - benchmark direct-process runs
-- non-`vLLM` backends
+- undocumented upstream parity or support claims
+
+Capability and contract assumptions:
+
+- workers advertise which direct-process backends and topologies they support
+- scheduling is expected to place direct-process deployments only on workers that advertise the required backend and topology support
+- `custom backend` is the community path for backends that can be described with command, env, health, timeout, workdir, and stop controls
+- `custom backend` does not mean every external backend works automatically
 
 Host prerequisites for this fork mode:
 
-- `vllm` must already be installed in the worker environment
+- the backend executable must already be installed in the worker environment, for example `vllm`, `sglang`, `mindie`, `vox-box`, `llama-server`, or the executable used by a `custom backend`
 - required GPU drivers, runtime libraries, and Python dependencies must already be available on the host or inside the worker container
 - worker-managed directories must be writable
 - localhost ports required by readiness checks must be available
@@ -48,9 +59,9 @@ Host prerequisites for this fork mode:
 Operator flow for a worker that is already running inside a Linux container:
 
 1. Start the worker with `GPUSTACK_DIRECT_PROCESS_MODE=true`.
-2. Confirm the worker environment can run `vllm serve` before registering the worker.
+2. Confirm the worker environment can run the backend command you plan to use before registering the worker.
 3. Register the worker with the GPUStack server through the normal worker startup flow.
-4. Deploy only single-worker `vLLM` models to that worker.
+4. Deploy direct-process workloads only for the backends and topologies that worker advertises. In Part 2, distributed direct-process is `vLLM`-only.
 5. Check `gpustack/logs/serve/<model-instance-id>.log` for launch and runtime logs.
 
 Restart behavior is cleanup-and-recreate only. On worker restart, this fork cleans stale direct-process entries and starts a new process when needed. It does not reattach to an already running serving process.

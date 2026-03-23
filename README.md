@@ -63,19 +63,28 @@ For detailed benchmarking methods and results, visit our [Inference Performance 
 
 ### Fork-only direct-process note
 
-This fork also includes an experimental worker option for operators who already run the GPUStack worker inside a Linux container or directly on a Linux host and want `vLLM` to start as a direct host process instead of creating nested model containers.
+This fork also includes an experimental worker option for operators who already run the GPUStack worker inside a Linux container or directly on a Linux host and want model servers to start as direct host processes instead of creating nested model containers.
 
-Container deployment remains the default and recommended GPUStack path. Treat direct-process mode as a fork-only operator workflow, not an official upstream GPUStack feature.
+Container deployment remains supported, and it is still the default and recommended GPUStack path. Treat direct-process mode as a fork-only operator workflow, not an official upstream GPUStack feature.
 
-Direct-process mode is enabled per worker with `GPUSTACK_DIRECT_PROCESS_MODE=true` and is intentionally narrow:
+Direct-process mode is enabled per worker with `GPUSTACK_DIRECT_PROCESS_MODE=true`. In Part 2, the worker advertises direct-process capabilities for the backends it can launch, but the runtime mode is still worker-global. A worker is either in container mode or in direct-process mode for all deployments placed on that worker.
+
+Part 2 backend coverage in this fork:
+
+- built-in single-worker direct-process support for `vLLM`, `SGLang`, `MindIE`, and `VoxBox`
+- first-class single-worker direct-process support for `llama.cpp`
+- generic `custom backend` direct-process support for community backends that fit the custom command, env, health, timeout, workdir, and stop contract
+- distributed direct-process support for `vLLM` only in this phase
+
+Current limits and non-goals:
 
 - Linux worker only
-- single-worker deployments only
-- `vLLM` only
-- no distributed or subordinate-worker serving
-- no benchmark direct-process runs
+- container mode remains supported alongside this worker option, but not mixed on the same worker
+- non-`vLLM` distributed direct-process is out of scope in Part 2
+- benchmark direct-process runs are out of scope
+- `custom backend` does not imply support for every external backend, only for backends that satisfy the documented contract
 
-When this mode is enabled, the worker expects host-side prerequisites that container deployment normally hides, including an available `vllm` executable, the required Python and GPU runtime libraries, writable worker directories, and the localhost ports needed for readiness checks.
+When this mode is enabled, the worker expects host-side prerequisites that container deployment normally hides. That includes the backend executable for the selected direct-process path, the required Python and GPU runtime libraries, writable worker directories, and the localhost ports needed for readiness checks.
 
 Direct-process instances use file logs as the canonical log source at `gpustack/logs/serve/<model-instance-id>.log`. On worker restart, this fork uses a cleanup-and-recreate policy. It kills stale direct-process entries and starts clean instead of trying to reattach to an existing serving process.
 
@@ -153,9 +162,9 @@ Open your browser and navigate to `http://your_host_ip` to access the GPUStack U
 Fork-only direct-process workflow for a worker that is already running in a Linux container:
 
 1. Start the worker with `GPUSTACK_DIRECT_PROCESS_MODE=true` in its environment.
-2. Make sure the worker environment already has `vllm` and the required host GPU libraries available.
+2. Make sure the worker environment already has the backend executable you plan to use, such as `vllm`, `sglang`, `mindie`, `vox-box`, `llama-server`, or a `custom backend` command that matches the documented contract, plus the required host GPU libraries.
 3. Keep the worker on the normal container-based registration path so it still connects to the GPUStack server in the usual way.
-4. Deploy only single-worker `vLLM` models on that worker.
+4. Deploy single-worker direct-process models for the backends that worker advertises. Use distributed direct-process only for `vLLM` in this phase.
 5. Read direct-process serve logs from `gpustack/logs/serve/<model-instance-id>.log` if launch or readiness fails.
 
 ### Deploy a Model
