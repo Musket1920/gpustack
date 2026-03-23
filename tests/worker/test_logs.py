@@ -215,3 +215,81 @@ async def test_container_mode_logs_still_probe_container_stream(monkeypatch, tmp
         {"name": "test-instance", "tail": 1, "follow": False},
         {"name": "test-instance", "tail": -1, "follow": False},
     ]
+
+
+# ---------------------------------------------------------------------------
+# Characterization: file-log routing contract is locked
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_direct_process_file_only_no_file_raises_not_found(monkeypatch, tmp_path):
+    """Characterization: file_only=True with no log file raises NotFoundException, not silent empty."""
+    container_calls: list[dict] = []
+
+    def record_logs_workload(**kwargs):
+        container_calls.append(kwargs)
+        return "should not be called"
+
+    monkeypatch.setattr(route_logs, "logs_workload", record_logs_workload)
+
+    # Import NotFoundException from the api module
+    from gpustack.api.exceptions import NotFoundException
+
+    with pytest.raises(NotFoundException):
+        async for _ in route_logs.combined_log_generator(
+            str(tmp_path / "nonexistent.log"),
+            "",
+            LogOptions(follow=False),
+            "test-instance",
+            file_log_exists=False,
+            file_only=True,
+        ):
+            pass
+
+    assert container_calls == [], "container must not be probed when file_only=True"
+
+
+@pytest.mark.asyncio
+async def test_direct_process_file_only_never_calls_container(monkeypatch, tmp_path):
+    """Characterization: file_only=True never calls logs_workload regardless of content."""
+    log_file = tmp_path / "direct.log"
+    log_file.write_text("direct-line\n", encoding="utf-8")
+    container_calls: list[dict] = []
+
+    def record_logs_workload(**kwargs):
+        container_calls.append(kwargs)
+        return "should not be called"
+
+    monkeypatch.setattr(route_logs, "logs_workload", record_logs_workload)
+
+    result = normalize_newlines(
+        [
+            line
+            async for line in route_logs.combined_log_generator(
+                str(log_file),
+                "",
+                LogOptions(follow=False),
+                "test-instance",
+                file_log_exists=True,
+                file_only=True,
+            )
+        ]
+    )
+
+    assert result == ["direct-line\n"]
+    assert container_calls == [], "container must not be probed when file_only=True"
+
+
+@pytest.mark.asyncio
+async def test_log_generator_file_path_is_canonical_source_for_direct_process(tmp_path):
+    """Characterization: log_generator reads from the exact file path provided."""
+    log_file = tmp_path / "serve" / "42.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("instance-42-line\n", encoding="utf-8")
+
+    options = LogOptions()
+    result = normalize_newlines(
+        [line async for line in log_generator(str(log_file), options)]
+    )
+
+    assert result == ["instance-42-line\n"]

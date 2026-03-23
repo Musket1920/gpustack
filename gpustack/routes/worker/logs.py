@@ -12,6 +12,7 @@ from gpustack_runtime.deployer import logs_workload
 
 from gpustack.api.exceptions import NotFoundException
 from gpustack.worker.logs import LogOptions, LogOptionsDep, log_generator
+from gpustack.worker.process_registry import DirectProcessRegistry
 from gpustack.utils import file
 from gpustack.server.deps import SessionDep
 from gpustack import envs
@@ -307,6 +308,7 @@ async def combined_log_generator(
     model_instance_name: str,
     file_log_exists: bool = True,
     file_only: bool = False,
+    extra_file_log_paths: Optional[list[str]] = None,
 ):
     """Unified log streaming across three startup phases.
 
@@ -343,6 +345,12 @@ async def combined_log_generator(
     if file_log_exists:
         file_tasks.append(log_generator(main_log_path, options))
 
+    for extra_log_path in extra_file_log_paths or []:
+        if extra_log_path == main_log_path:
+            continue
+        if Path(extra_log_path).exists():
+            file_tasks.append(log_generator(extra_log_path, options))
+
     if file_only:
         if not file_tasks:
             raise NotFoundException(message="Log file not found")  # type: ignore[call-arg]
@@ -372,6 +380,12 @@ async def combined_log_generator(
 
     if file_log_exists:
         file_tasks.append(log_generator(main_log_path, file_options))
+
+    for extra_log_path in extra_file_log_paths or []:
+        if extra_log_path == main_log_path:
+            continue
+        if Path(extra_log_path).exists():
+            file_tasks.append(log_generator(extra_log_path, file_options))
 
     # Prepare container logs (Phase 2)
     if (
@@ -438,10 +452,27 @@ async def get_serve_logs(
                 file_only=bool(
                     getattr(request.app.state.config, "direct_process_mode", False)
                 ),
+                extra_file_log_paths=(
+                    _get_direct_process_log_paths(request.app.state.config, id)
+                    if getattr(request.app.state.config, "direct_process_mode", False)
+                    else None
+                ),
             ),
         ),
         media_type="application/octet-stream",
     )
+
+
+def _get_direct_process_log_paths(config, model_instance_id: int) -> list[str]:
+    registry = DirectProcessRegistry(config)
+    entries = registry.list_by_model_instance_id(model_instance_id)
+    log_paths: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry.log_path and entry.log_path not in seen:
+            seen.add(entry.log_path)
+            log_paths.append(entry.log_path)
+    return log_paths
 
 
 @router.get("/benchmark_logs/{id}")

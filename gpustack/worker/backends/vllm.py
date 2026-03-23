@@ -52,12 +52,51 @@ logger = logging.getLogger(__name__)
 
 
 class VLLMServer(InferenceServer):
+    _DIRECT_PROCESS_RUNTIME_NAME = "serve"
+    _DIRECT_PROCESS_RAY_HEAD_RUNTIME_NAME = "ray-head"
+    _DIRECT_PROCESS_RAY_WORKER_RUNTIME_NAME = "ray-worker"
     """
     Containerized vLLM inference server backend using gpustack-runtime.
 
     This backend runs vLLM in a Docker container managed by gpustack-runtime,
     providing better isolation, resource management, and deployment consistency.
     """
+
+    # ------------------------------------------------------------------
+    # Shared direct-process contract implementation
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def supports_direct_process(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_distributed_direct_process(cls) -> bool:
+        return True
+
+    def build_direct_process_command(self, port: int) -> List[str]:
+        return self._build_command_args(port=port, is_distributed=False)
+
+    def build_direct_process_env(self) -> Dict[str, str]:
+        return self._get_configured_env(is_distributed=False)
+
+    def get_direct_process_health_path(self) -> str:
+        return "/v1/models"
+
+    def preflight_direct_process(
+        self,
+        command_args: List[str],
+        env: Dict[str, str],
+        port: int,
+    ) -> None:
+        return self._preflight_direct_process(
+            command_args=command_args, env=env, port=port
+        )
+
+    def start_direct_process(self):
+        return self._start_direct_process(self._get_deployment_metadata())
+
+    # ------------------------------------------------------------------
 
     def start(self):  # noqa: C901
         try:
@@ -103,46 +142,151 @@ class VLLMServer(InferenceServer):
         self,
         deployment_metadata: ModelInstanceDeploymentMetadata,
     ) -> Dict[str, int | str | None]:
-        if (
-            deployment_metadata.distributed
-            or deployment_metadata.distributed_leader
+        if deployment_metadata.distributed and not (
+            deployment_metadata.distributed_leader
             or deployment_metadata.distributed_follower
         ):
             raise ValueError(
-                "Direct-process vLLM does not support distributed or Ray launches."
+                "Direct-process vLLM distributed launches require an explicit leader or follower role."
             )
 
+        if not deployment_metadata.distributed:
+            port = self._get_serving_port()
+            env = self._get_configured_env(is_distributed=False)
+            command_args = self._build_command_args(
+                port=port,
+                is_distributed=False,
+            )
+            self._preflight_direct_process(command_args=command_args, env=env, port=port)
+
+            logger.info(f"Starting vLLM direct process: {deployment_metadata.name}")
+            logger.info(
+                f"With arguments: [{' '.join(command_args)}], "
+                f"envs(inconsistent input items mean unchangeable):{os.linesep}"
+                f"{os.linesep.join(f'{k}={v}' for k, v in sorted(sanitize_env(env).items()))}"
+            )
+
+            process = self._spawn_direct_process(command_args, env)
+
+            logger.info(
+                f"Started vLLM direct process: {deployment_metadata.name}, pid: {process.pid}"
+            )
+            return {
+                "pid": process.pid,
+                "process_group_id": get_process_group_id(process.pid),
+                "port": port,
+                "mode": DIRECT_PROCESS_RUNTIME_MODE,
+            }
+
+        return self._start_distributed_direct_process(deployment_metadata)
+
+    def _start_distributed_direct_process(
+        self,
+        deployment_metadata: ModelInstanceDeploymentMetadata,
+    ) -> Dict[str, object]:
+        env = self._get_configured_env(is_distributed=True)
         port = self._get_serving_port()
-        env = self._get_configured_env(is_distributed=False)
-        command_args = self._build_command_args(
-            port=port,
-            is_distributed=False,
-        )
-        self._preflight_direct_process(command_args=command_args, env=env, port=port)
+        runtime_entries: List[Dict[str, object]] = []
 
-        logger.info(f"Starting vLLM direct process: {deployment_metadata.name}")
-        logger.info(
-            f"With arguments: [{' '.join(command_args)}], "
-            f"envs(inconsistent input items mean unchangeable):{os.linesep}"
-            f"{os.linesep.join(f'{k}={v}' for k, v in sorted(sanitize_env(env).items()))}"
-        )
+        if deployment_metadata.distributed_leader:
+            command_args = self._build_command_args(port=port, is_distributed=True)
+            self._preflight_direct_process(command_args=command_args, env=env, port=port)
+            ray_command, ray_command_args, _ = self._build_ray_configuration(is_leader=True)
 
-        process = subprocess.Popen(
-            command_args,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            start_new_session=os.name != "nt",
-        )
+            ray_log_path = self._runtime_log_path(self._DIRECT_PROCESS_RAY_HEAD_RUNTIME_NAME)
+            ray_process = self._spawn_direct_process(ray_command + ray_command_args, env, ray_log_path)
+            serve_process = self._spawn_direct_process(command_args, env)
 
-        logger.info(
-            f"Started vLLM direct process: {deployment_metadata.name}, pid: {process.pid}"
+            runtime_entries.extend(
+                [
+                    {
+                        "deployment_name": f"{deployment_metadata.name}-ray-head",
+                        "runtime_name": self._DIRECT_PROCESS_RAY_HEAD_RUNTIME_NAME,
+                        "pid": ray_process.pid,
+                        "process_group_id": get_process_group_id(ray_process.pid),
+                        "port": self._model_instance.ports[-1],
+                        "log_path": ray_log_path,
+                    },
+                    {
+                        "deployment_name": deployment_metadata.name,
+                        "runtime_name": self._DIRECT_PROCESS_RUNTIME_NAME,
+                        "pid": serve_process.pid,
+                        "process_group_id": get_process_group_id(serve_process.pid),
+                        "port": port,
+                        "log_path": self._runtime_log_path(self._DIRECT_PROCESS_RUNTIME_NAME),
+                    },
+                ]
+            )
+        elif deployment_metadata.distributed_follower:
+            ray_command, ray_command_args, _ = self._build_ray_configuration(is_leader=False)
+            ray_log_path = self._runtime_log_path(self._DIRECT_PROCESS_RUNTIME_NAME)
+            ray_process = self._spawn_direct_process(ray_command + ray_command_args, env)
+            runtime_entries.append(
+                {
+                    "deployment_name": deployment_metadata.name,
+                    "runtime_name": self._DIRECT_PROCESS_RAY_WORKER_RUNTIME_NAME,
+                    "pid": ray_process.pid,
+                    "process_group_id": get_process_group_id(ray_process.pid),
+                    "port": self._model_instance.ports[-1],
+                    "log_path": ray_log_path,
+                }
+            )
+        else:
+            raise ValueError(
+                "Direct-process vLLM distributed launches require an explicit leader or follower role."
+            )
+
+        primary_entry = next(
+            (
+                entry
+                for entry in runtime_entries
+                if entry["runtime_name"]
+                in {
+                    self._DIRECT_PROCESS_RUNTIME_NAME,
+                    self._DIRECT_PROCESS_RAY_WORKER_RUNTIME_NAME,
+                }
+            ),
+            runtime_entries[0],
         )
         return {
-            "pid": process.pid,
-            "process_group_id": get_process_group_id(process.pid),
-            "port": port,
+            "pid": primary_entry["pid"],
+            "process_group_id": primary_entry["process_group_id"],
+            "port": primary_entry["port"],
             "mode": DIRECT_PROCESS_RUNTIME_MODE,
+            "runtime_entries": runtime_entries,
         }
+
+    def _runtime_log_path(self, runtime_name: str) -> str:
+        log_path = getattr(self, "_direct_process_log_file_path", "") or ""
+        if not log_path:
+            return log_path
+
+        if runtime_name == self._DIRECT_PROCESS_RUNTIME_NAME:
+            return log_path
+
+        path = Path(log_path)
+        suffix = "".join(path.suffixes) or ".log"
+        stem = path.name[: -len(suffix)] if path.name.endswith(suffix) else path.stem
+        return str(path.with_name(f"{stem}.{runtime_name}{suffix}"))
+
+    def _spawn_direct_process(
+        self,
+        command_args: List[str],
+        env: Dict[str, str],
+        log_path: Optional[str] = None,
+    ):
+        popen_kwargs = {
+            "env": env,
+            "stdin": subprocess.DEVNULL,
+            "start_new_session": os.name != "nt",
+        }
+        if log_path:
+            log_handle = open(log_path, "a", buffering=1, encoding="utf-8")
+            popen_kwargs["stdout"] = log_handle
+            popen_kwargs["stderr"] = log_handle
+
+        process = subprocess.Popen(command_args, **popen_kwargs)
+        return process
 
     def _preflight_direct_process(
         self,

@@ -42,13 +42,18 @@ def _getpgid(pid: int) -> Optional[int]:
 
 class DirectProcessRegistryEntry(BaseModel):
     model_instance_id: int
+    worker_id: Optional[int] = None
     deployment_name: str
+    runtime_name: str = "serve"
     pid: int
     process_group_id: Optional[int] = None
     port: int
     log_path: str
     backend: str
     mode: str
+    startup_timeout_seconds: Optional[int] = None
+    stop_signal: Optional[str] = None
+    stop_timeout_seconds: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     pid_started_at: Optional[datetime] = None
@@ -111,13 +116,18 @@ def get_process_started_at(pid: int) -> Optional[datetime]:
 
 def build_direct_process_registry_entry(
     model_instance_id: int,
+    worker_id: Optional[int],
     deployment_name: str,
+    runtime_name: str,
     pid: int,
     port: int,
     log_path: str,
     backend: str,
     mode: str = DIRECT_PROCESS_RUNTIME_MODE,
     process_group_id: Optional[int] = None,
+    startup_timeout_seconds: Optional[int] = None,
+    stop_signal: Optional[str] = None,
+    stop_timeout_seconds: Optional[int] = None,
     created_at: Optional[datetime] = None,
     updated_at: Optional[datetime] = None,
 ) -> DirectProcessRegistryEntry:
@@ -126,7 +136,9 @@ def build_direct_process_registry_entry(
 
     return DirectProcessRegistryEntry(
         model_instance_id=model_instance_id,
+        worker_id=worker_id,
         deployment_name=deployment_name,
+        runtime_name=runtime_name,
         pid=pid,
         process_group_id=(
             process_group_id if process_group_id is not None else get_process_group_id(pid)
@@ -135,6 +147,9 @@ def build_direct_process_registry_entry(
         log_path=log_path,
         backend=backend.value if isinstance(backend, Enum) else str(backend),
         mode=mode,
+        startup_timeout_seconds=startup_timeout_seconds,
+        stop_signal=stop_signal,
+        stop_timeout_seconds=stop_timeout_seconds,
         created_at=created_time,
         updated_at=updated_time,
         pid_started_at=get_process_started_at(pid),
@@ -209,6 +224,7 @@ def map_direct_process_state_transition(
     current_state: ModelInstanceStateEnum,
     entry_status: DirectProcessRegistryStatus,
     is_ready: bool,
+    now: Optional[datetime] = None,
 ) -> DirectProcessStateTransition:
     if entry_status.status == DirectProcessEntryStatus.MISSING:
         return DirectProcessStateTransition(
@@ -250,6 +266,35 @@ def map_direct_process_state_transition(
             ),
             state_message=("" if current_state != ModelInstanceStateEnum.RUNNING else None),
         )
+
+    entry = entry_status.entry
+    startup_timeout_seconds = (
+        entry.startup_timeout_seconds if entry is not None else None
+    )
+    if (
+        startup_timeout_seconds is not None
+        and startup_timeout_seconds > 0
+        and entry is not None
+    ):
+        current_time = now or utcnow()
+        startup_age_seconds = (current_time - entry.created_at).total_seconds()
+        if startup_age_seconds >= startup_timeout_seconds:
+            return DirectProcessStateTransition(
+                runtime_state=DirectProcessRuntimeState.STARTING,
+                next_state=(
+                    None
+                    if current_state == ModelInstanceStateEnum.ERROR
+                    else ModelInstanceStateEnum.ERROR
+                ),
+                state_message=(
+                    None
+                    if current_state == ModelInstanceStateEnum.ERROR
+                    else (
+                        "Inference server did not become ready within "
+                        f"{startup_timeout_seconds} seconds."
+                    )
+                ),
+            )
 
     if current_state in _TRANSITIONAL_MODEL_INSTANCE_STATES:
         return DirectProcessStateTransition(
@@ -297,14 +342,21 @@ class DirectProcessRegistry:
     def get_by_model_instance_id(
         self, model_instance_id: int
     ) -> Optional[DirectProcessRegistryEntry]:
-        return next(
-            (
-                entry
-                for entry in self._read_entries()
-                if entry.model_instance_id == model_instance_id
-            ),
-            None,
-        )
+        entries = self.list_by_model_instance_id(model_instance_id)
+        if not entries:
+            return None
+
+        primary = next((entry for entry in entries if entry.runtime_name == "serve"), None)
+        return primary or entries[0]
+
+    def list_by_model_instance_id(
+        self, model_instance_id: int
+    ) -> List[DirectProcessRegistryEntry]:
+        return [
+            entry
+            for entry in self._read_entries()
+            if entry.model_instance_id == model_instance_id
+        ]
 
     def get_by_deployment_name(
         self, deployment_name: str
@@ -333,13 +385,18 @@ class DirectProcessRegistry:
         entry: Optional[DirectProcessRegistryEntry] = None,
         *,
         model_instance_id: Optional[int] = None,
+        worker_id: Optional[int] = None,
         deployment_name: Optional[str] = None,
+        runtime_name: str = "serve",
         pid: Optional[int] = None,
         port: Optional[int] = None,
         log_path: Optional[str] = None,
         backend: Optional[str] = None,
         mode: str = DIRECT_PROCESS_RUNTIME_MODE,
         process_group_id: Optional[int] = None,
+        startup_timeout_seconds: Optional[int] = None,
+        stop_signal: Optional[str] = None,
+        stop_timeout_seconds: Optional[int] = None,
     ) -> DirectProcessRegistryEntry:
         if entry is None:
             if None in [
@@ -367,13 +424,18 @@ class DirectProcessRegistry:
             entry_backend = backend
             entry = build_direct_process_registry_entry(
                 model_instance_id=entry_model_instance_id,
+                worker_id=worker_id,
                 deployment_name=entry_deployment_name,
+                runtime_name=runtime_name,
                 pid=entry_pid,
                 port=entry_port,
                 log_path=entry_log_path,
                 backend=entry_backend,
                 mode=mode,
                 process_group_id=process_group_id,
+                startup_timeout_seconds=startup_timeout_seconds,
+                stop_signal=stop_signal,
+                stop_timeout_seconds=stop_timeout_seconds,
             )
 
         with self._lock:
@@ -382,8 +444,8 @@ class DirectProcessRegistry:
                 (
                     current
                     for current in entries
-                    if current.model_instance_id == entry.model_instance_id
-                    or current.deployment_name == entry.deployment_name
+                    if current.deployment_name == entry.deployment_name
+                    and current.runtime_name == entry.runtime_name
                 ),
                 None,
             )
@@ -398,26 +460,38 @@ class DirectProcessRegistry:
             filtered_entries = [
                 current
                 for current in entries
-                if current.model_instance_id != normalized_entry.model_instance_id
-                and current.deployment_name != normalized_entry.deployment_name
+                if not (
+                    current.deployment_name == normalized_entry.deployment_name
+                    and current.runtime_name == normalized_entry.runtime_name
+                )
             ]
             filtered_entries.append(normalized_entry)
             self._write_entries(filtered_entries)
             return normalized_entry
 
     def remove_by_model_instance_id(self, model_instance_id: int) -> Optional[DirectProcessRegistryEntry]:
+        removed_entries = self.remove_all_by_model_instance_id(model_instance_id)
+        if not removed_entries:
+            return None
+
+        primary = next(
+            (entry for entry in removed_entries if entry.runtime_name == "serve"),
+            None,
+        )
+        return primary or removed_entries[0]
+
+    def remove_all_by_model_instance_id(
+        self, model_instance_id: int
+    ) -> List[DirectProcessRegistryEntry]:
         with self._lock:
             entries = self._read_entries()
-            removed_entry = next(
-                (
-                    entry
-                    for entry in entries
-                    if entry.model_instance_id == model_instance_id
-                ),
-                None,
-            )
-            if removed_entry is None:
-                return None
+            removed_entries = [
+                entry
+                for entry in entries
+                if entry.model_instance_id == model_instance_id
+            ]
+            if not removed_entries:
+                return []
 
             self._write_entries(
                 [
@@ -426,7 +500,7 @@ class DirectProcessRegistry:
                     if entry.model_instance_id != model_instance_id
                 ]
             )
-            return removed_entry
+            return removed_entries
 
     def remove_by_deployment_name(self, deployment_name: str) -> Optional[DirectProcessRegistryEntry]:
         with self._lock:

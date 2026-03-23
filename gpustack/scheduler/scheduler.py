@@ -44,7 +44,7 @@ from gpustack.scheduler.queue import AsyncUniqueQueue
 from gpustack.policies.worker_filters.status_filter import StatusFilter
 from gpustack import envs
 from gpustack.schemas.inference_backend import is_built_in_backend
-from gpustack.schemas.workers import Worker
+from gpustack.schemas.workers import DirectProcessCapabilities, Worker
 from gpustack.schemas.models import (
     BackendEnum,
     CategoryEnum,
@@ -80,6 +80,13 @@ from gpustack.scheduler.calculator import get_pretrained_config_with_workers
 from sqlalchemy.orm.attributes import flag_modified
 
 logger = logging.getLogger(__name__)
+
+DIRECT_PROCESS_DISTRIBUTED_VLLM_CANDIDATE_MESSAGE = (
+    "Distributed vLLM direct process scheduling requires every selected worker to advertise distributed vLLM support."
+)
+DIRECT_PROCESS_DISTRIBUTED_NON_VLLM_CANDIDATE_MESSAGE = (
+    "Direct process mode supports distributed scheduling only for the vLLM backend."
+)
 
 
 class Scheduler:
@@ -448,6 +455,9 @@ async def find_candidate(
 
     # Select candidates.
     candidates = await candidates_selector.select_candidates(workers)
+    candidates, candidate_messages = _filter_unsupported_direct_process_candidates(
+        model, workers, candidates
+    )
 
     # Score candidates.
     candidate_scorers = [
@@ -473,11 +483,75 @@ async def find_candidate(
             "No workers meet the resource requirements."
         ]
         messages.extend(resource_fit_messages)
+        messages.extend(candidate_messages)
     elif candidate and candidate.overcommit:
         messages.extend(candidates_selector.get_messages())
 
     # Return the candidate and messages.
     return candidate, messages
+
+
+def _filter_unsupported_direct_process_candidates(
+    model: Model,
+    workers: List[Worker],
+    candidates: List[ModelInstanceScheduleCandidate],
+) -> Tuple[List[ModelInstanceScheduleCandidate], List[str]]:
+    workers_by_id = {worker.id: worker for worker in workers}
+    filtered_candidates: List[ModelInstanceScheduleCandidate] = []
+    messages: List[str] = []
+
+    for candidate in candidates:
+        if not candidate.subordinate_workers:
+            filtered_candidates.append(candidate)
+            continue
+
+        involved_workers = [candidate.worker]
+        missing_workers = []
+        for subordinate in candidate.subordinate_workers:
+            worker = workers_by_id.get(subordinate.worker_id)
+            if worker is None:
+                missing_workers.append(subordinate.worker_name or str(subordinate.worker_id))
+                continue
+            involved_workers.append(worker)
+
+        if missing_workers:
+            messages.append(
+                "Candidate filtered out: selected subordinate workers are unavailable: "
+                + ", ".join(missing_workers)
+            )
+            continue
+
+        capabilities = [
+            DirectProcessCapabilities.from_labels(worker.labels)
+            for worker in involved_workers
+        ]
+        if not any(cap.enabled for cap in capabilities):
+            filtered_candidates.append(candidate)
+            continue
+
+        backend = get_backend(model)
+        if backend != BackendEnum.VLLM:
+            messages.append(
+                f"Candidate filtered out: {DIRECT_PROCESS_DISTRIBUTED_NON_VLLM_CANDIDATE_MESSAGE} Got '{backend}'."
+            )
+            continue
+
+        unsupported_workers = [
+            worker.name
+            for worker, cap in zip(involved_workers, capabilities)
+            if not cap.supports_distributed_backend(BackendEnum.VLLM)
+        ]
+        if unsupported_workers:
+            messages.append(
+                "Candidate filtered out: "
+                f"{DIRECT_PROCESS_DISTRIBUTED_VLLM_CANDIDATE_MESSAGE} "
+                f"Unsupported workers: {', '.join(unsupported_workers)}."
+            )
+            continue
+
+        filtered_candidates.append(candidate)
+
+    return filtered_candidates, messages
 
 
 def pick_highest_score_candidate(candidates: List[ModelInstanceScheduleCandidate]):

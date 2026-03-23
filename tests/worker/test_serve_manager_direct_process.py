@@ -1,4 +1,5 @@
 import contextlib
+from datetime import datetime, timedelta, timezone
 import importlib
 import subprocess
 import sys
@@ -39,6 +40,16 @@ def _import_worker_module(module_name: str):
             sys.modules.pop("fcntl", None)
         else:
             sys.modules["fcntl"] = original_fcntl
+
+
+def test_serve_manager_maps_llama_cpp_to_first_class_server():
+    serve_manager_module = _import_worker_module("gpustack.worker.serve_manager")
+    llama_cpp_module = _import_worker_module("gpustack.worker.backends.llama_cpp")
+
+    assert (
+        serve_manager_module._SERVER_CLASS_MAPPING[BackendEnum.LLAMA_CPP]
+        is llama_cpp_module.LlamaCppServer
+    )
 
 
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
@@ -421,6 +432,110 @@ def test_direct_process_stop_kills_process_tree_from_registry(tmp_path: Path):
                 process.wait(timeout=5)
 
 
+def test_direct_process_stop_uses_contract_signal_and_timeout(monkeypatch, tmp_path: Path):
+    manager, _, _ = _build_manager(
+        serve_manager_module,
+        tmp_path,
+        make_model_instance(state=ModelInstanceStateEnum.RUNNING),
+    )
+    entry = serve_manager_module.DirectProcessRegistryEntry(
+        model_instance_id=1,
+        worker_id=1,
+        deployment_name="custom-stop-contract",
+        runtime_name="serve",
+        pid=4321,
+        process_group_id=8765,
+        port=18080,
+        log_path=str(tmp_path / "serve" / "1.log"),
+        backend=BackendEnum.CUSTOM,
+        mode=serve_manager_module.DIRECT_PROCESS_RUNTIME_MODE,
+        stop_signal="SIGINT",
+        stop_timeout_seconds=7,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    observed: dict = {}
+
+    class _FakeProcess:
+        def children(self, recursive=False):
+            return []
+
+        def wait(self, timeout=None):
+            observed["wait_timeout"] = timeout
+
+    monkeypatch.setattr(serve_manager_module.platform, "system", lambda: "linux")
+    monkeypatch.setattr(
+        serve_manager_module.os,
+        "killpg",
+        lambda pgid, sig: observed.update({"process_group_id": pgid, "signal": sig}),
+        raising=False,
+    )
+    monkeypatch.setattr(serve_manager_module.psutil, "Process", lambda _pid: _FakeProcess())
+    monkeypatch.setattr(serve_manager_module.psutil, "pid_exists", lambda _pid: False)
+    monkeypatch.setattr(
+        serve_manager_module,
+        "terminate_process_tree",
+        lambda _pid: observed.update({"terminate_called": True}),
+    )
+
+    serve_manager_module.ServeManager._terminate_direct_process_entry(manager, entry)
+
+    assert observed["process_group_id"] == 8765
+    assert observed["signal"] == serve_manager_module.signal.SIGINT
+    assert observed["wait_timeout"] == 7
+    assert "terminate_called" not in observed
+
+
+def test_direct_process_sync_marks_startup_timeout_as_error(tmp_path: Path):
+    model_instance = make_model_instance(
+        state=ModelInstanceStateEnum.STARTING,
+        port=18083,
+        ports=[18083],
+        pid=1234,
+    )
+    manager, model, updates = _build_manager(serve_manager_module, tmp_path, model_instance)
+    created_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+
+    manager._direct_process_registry.upsert(
+        model_instance_id=model_instance.id,
+        deployment_name=model_instance.name,
+        pid=1234,
+        port=model_instance.port,
+        log_path=str(Path(manager._serve_log_dir) / f"{model_instance.id}.log"),
+        backend=BackendEnum.CUSTOM,
+        startup_timeout_seconds=5,
+    )
+    entry = manager._direct_process_registry.get_by_model_instance_id(model_instance.id)
+    assert entry is not None
+    timed_out_entry = entry.model_copy(
+        update={
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+    )
+    manager._direct_process_registry.inspect_by_model_instance_id = lambda _id: (  # type: ignore[method-assign]
+        serve_manager_module.DirectProcessRegistryStatus(
+            status=serve_manager_module.DirectProcessEntryStatus.LIVE,
+            reason="pid_running",
+            entry=timed_out_entry,
+        )
+    )
+
+    manager._inference_backend_manager = SimpleNamespace(
+        get_backend_by_name=lambda _backend: SimpleNamespace(health_check_path="/health")
+    )
+    manager._get_model = lambda _mi: model.model_copy(update={"backend": BackendEnum.CUSTOM})
+    manager._refresh_model = manager._get_model
+
+    serve_manager_module.ServeManager._sync_direct_process_model_instance(
+        manager, model_instance
+    )
+
+    assert model_instance.state == ModelInstanceStateEnum.ERROR
+    assert model_instance.state_message == "Inference server did not become ready within 5 seconds."
+    assert updates[-1]["state"] == ModelInstanceStateEnum.ERROR
+
+
 def test_direct_process_stale_registry_cleanup_kills_orphaned_process_group(
     tmp_path: Path,
 ):
@@ -465,3 +580,125 @@ def test_direct_process_stale_registry_cleanup_kills_orphaned_process_group(
             with contextlib.suppress(Exception):
                 psutil.Process(process.pid).kill()
                 process.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Characterization: cleanup-and-recreate restart policy is locked
+# ---------------------------------------------------------------------------
+
+def test_direct_process_start_removes_stale_registry_entry_before_launch(
+    monkeypatch, tmp_path: Path
+):
+    """Characterization: _start_model_instance removes any existing registry entry before
+    launching a new process (cleanup-and-recreate policy, not reattach)."""
+    model_instance = make_model_instance()
+    manager, _, updates = _build_manager(serve_manager_module, tmp_path, model_instance)
+    process_factory = _ProcessFactory("ready")
+
+    # Pre-seed a stale registry entry for the same model instance
+    manager._direct_process_registry.upsert(
+        model_instance_id=model_instance.id,
+        deployment_name=model_instance.name,
+        pid=99999,  # non-existent PID
+        port=19999,
+        log_path=str(Path(manager._serve_log_dir) / f"{model_instance.id}.log"),
+        backend=BackendEnum.VLLM,
+    )
+    assert manager._direct_process_registry.get_by_model_instance_id(model_instance.id) is not None
+
+    monkeypatch.setattr(serve_manager_module, "get_meta_from_running_instance", lambda *_args: None)
+    monkeypatch.setattr(serve_manager_module.multiprocessing, "Process", process_factory)
+    monkeypatch.setattr(serve_manager_module.platform, "system", lambda: "linux")
+
+    try:
+        serve_manager_module.ServeManager._start_model_instance(manager, model_instance)
+
+        # After start, the stale entry (pid=99999) must be gone; a new entry is written by the provisioner
+        assert _wait_until(lambda: not manager._is_provisioning(model_instance))
+        # The registry entry written by the provisioner must have the real PID, not the stale one
+        assert _wait_until(
+            lambda: serve_manager_module.is_ready(
+                BackendEnum.VLLM,
+                model_instance,
+                "/v1/models",
+                make_model(),
+            )
+        )
+        serve_manager_module.ServeManager.sync_model_instances_state(manager)
+
+        entry = manager._direct_process_registry.get_by_model_instance_id(model_instance.id)
+        assert entry is not None
+        assert entry.pid != 99999, "stale PID must have been replaced by cleanup-and-recreate"
+    finally:
+        for process in process_factory.instances:
+            process.cleanup()
+
+
+def test_direct_process_stop_removes_registry_entry(monkeypatch, tmp_path: Path):
+    """Characterization: _stop_model_instance removes the registry entry after killing the process."""
+    model_instance = make_model_instance()
+    manager, _, _ = _build_manager(serve_manager_module, tmp_path, model_instance)
+    process_factory = _ProcessFactory("ready")
+
+    monkeypatch.setattr(serve_manager_module, "get_meta_from_running_instance", lambda *_args: None)
+    monkeypatch.setattr(serve_manager_module.multiprocessing, "Process", process_factory)
+    monkeypatch.setattr(serve_manager_module.platform, "system", lambda: "linux")
+
+    try:
+        serve_manager_module.ServeManager._start_model_instance(manager, model_instance)
+        assert _wait_until(lambda: not manager._is_provisioning(model_instance))
+        assert _wait_until(
+            lambda: serve_manager_module.is_ready(
+                BackendEnum.VLLM,
+                model_instance,
+                "/v1/models",
+                make_model(),
+            )
+        )
+        serve_manager_module.ServeManager.sync_model_instances_state(manager)
+
+        # Registry entry must exist before stop
+        assert manager._direct_process_registry.get_by_model_instance_id(model_instance.id) is not None
+
+        serve_manager_module.ServeManager._stop_model_instance(manager, model_instance)
+
+        # Registry entry must be gone after stop
+        assert manager._direct_process_registry.get_by_model_instance_id(model_instance.id) is None
+    finally:
+        for process in process_factory.instances:
+            process.cleanup()
+
+
+def test_direct_process_log_path_is_serve_dir_model_instance_id(
+    monkeypatch, tmp_path: Path
+):
+    """Characterization: serve log path is <serve_log_dir>/<model_instance_id>.log."""
+    model_instance = make_model_instance()
+    manager, _, _ = _build_manager(serve_manager_module, tmp_path, model_instance)
+    process_factory = _ProcessFactory("ready")
+
+    monkeypatch.setattr(serve_manager_module, "get_meta_from_running_instance", lambda *_args: None)
+    monkeypatch.setattr(serve_manager_module.multiprocessing, "Process", process_factory)
+    monkeypatch.setattr(serve_manager_module.platform, "system", lambda: "linux")
+
+    try:
+        serve_manager_module.ServeManager._start_model_instance(manager, model_instance)
+        assert _wait_until(lambda: not manager._is_provisioning(model_instance))
+        assert _wait_until(
+            lambda: serve_manager_module.is_ready(
+                BackendEnum.VLLM,
+                model_instance,
+                "/v1/models",
+                make_model(),
+            )
+        )
+        serve_manager_module.ServeManager.sync_model_instances_state(manager)
+
+        entry = manager._direct_process_registry.get_by_model_instance_id(model_instance.id)
+        assert entry is not None
+        # Normalize separators for cross-platform comparison
+        expected_log_path = str(Path(manager._serve_log_dir) / f"{model_instance.id}.log")
+        assert Path(entry.log_path) == Path(expected_log_path)
+    finally:
+        for process in process_factory.instances:
+            process.cleanup()

@@ -8,7 +8,13 @@ from typing import Any, cast
 
 import pytest
 
-from gpustack.schemas.models import BackendEnum, ModelInstanceStateEnum
+from gpustack.schemas.models import (
+    BackendEnum,
+    DistributedServerCoordinateModeEnum,
+    DistributedServers,
+    ModelInstanceStateEnum,
+    ModelInstanceSubordinateWorker,
+)
 
 
 def _import_vllm_module():
@@ -60,6 +66,7 @@ def _make_server(
             data_dir=str(data_dir),
             cache_dir=str(cache_dir),
             log_dir=str(log_dir),
+            ray_port_range="41000-41999",
         ),
     )
     server._worker = cast(Any, SimpleNamespace(id=1, ip="127.0.0.1", ifname="lo"))
@@ -82,8 +89,15 @@ def _make_server(
             name="test-instance",
             model_name="test-model",
             port=8000,
-            ports=[8000],
+            ports=[8000, 8100],
             gpu_indexes=[0],
+            worker_ip="127.0.0.1",
+            distributed_servers=DistributedServers(
+                mode=DistributedServerCoordinateModeEnum.INITIALIZE_LATER,
+                subordinate_workers=[
+                    ModelInstanceSubordinateWorker(worker_id=2, worker_ip="127.0.0.2")
+                ],
+            ),
         ),
     )
     server._model_path = "/models/test-model"
@@ -197,47 +211,65 @@ def test_direct_process_host_prerequisites_pass_command_build_no_workload(
 
 
 @pytest.mark.parametrize(
-    "deployment_metadata",
+    ("deployment_metadata", "expected_runtime_names"),
     [
-        SimpleNamespace(
-            name="leader-distributed",
-            distributed=True,
-            distributed_leader=True,
-            distributed_follower=False,
+        (
+            SimpleNamespace(
+                name="leader-distributed",
+                distributed=True,
+                distributed_leader=True,
+                distributed_follower=False,
+            ),
+            ["ray-head", "serve"],
         ),
-        SimpleNamespace(
-            name="follower-distributed",
-            distributed=True,
-            distributed_leader=False,
-            distributed_follower=True,
+        (
+            SimpleNamespace(
+                name="follower-distributed",
+                distributed=True,
+                distributed_leader=False,
+                distributed_follower=True,
+            ),
+            ["ray-worker"],
         ),
     ],
     ids=["leader", "follower"],
 )
-def test_direct_process_vllm_unsupported_variants(
-    monkeypatch, tmp_path: Path, deployment_metadata
+def test_direct_process_vllm_distributed_returns_runtime_entries(
+    monkeypatch, tmp_path: Path, deployment_metadata, expected_runtime_names
 ):
     server = _make_server(tmp_path)
     server._get_deployment_metadata = lambda: deployment_metadata
+    if deployment_metadata.distributed_follower:
+        server._model_instance.worker_ip = "127.0.0.1"
+
+    popen_calls = []
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+    def fake_popen(args, **kwargs):
+        popen_calls.append((list(args), kwargs))
+        return FakeProcess(5000 + len(popen_calls))
 
     monkeypatch.setattr(
-        "gpustack.worker.backends.vllm.subprocess.Popen",
-        lambda *_args, **_kwargs: pytest.fail(
-            "unsupported direct-process vLLM variants must not spawn a process"
-        ),
+        "gpustack.worker.backends.vllm.shutil.which",
+        lambda *_args, **_kwargs: "/usr/bin/vllm",
     )
     monkeypatch.setattr(
-        "gpustack.worker.backends.vllm.create_workload",
-        lambda *_args, **_kwargs: pytest.fail(
-            "unsupported direct-process vLLM variants must not create workloads"
-        ),
+        "gpustack.worker.backends.vllm.socket.socket",
+        lambda *_args, **_kwargs: _FakeSocket(),
     )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.get_process_group_id", lambda pid: pid + 1
+    )
+    monkeypatch.setattr("gpustack.worker.backends.vllm.subprocess.Popen", fake_popen)
 
-    with pytest.raises(
-        ValueError,
-        match="Direct-process vLLM does not support distributed or Ray launches",
-    ):
-        server._start()
+    result = server._start()
+
+    assert result["mode"] == DIRECT_PROCESS_RUNTIME_MODE
+    assert [entry["runtime_name"] for entry in result["runtime_entries"]] == expected_runtime_names
+    assert len(popen_calls) == len(expected_runtime_names)
 
 
 def test_direct_process_host_prerequisites_fail_missing_vllm_updates_state_message(
@@ -277,3 +309,163 @@ def test_direct_process_host_prerequisites_fail_missing_vllm_updates_state_messa
         }
     ]
     assert "Direct-process vLLM preflight failed for test-instance" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Characterization: host prerequisite checks and return contract are locked
+# ---------------------------------------------------------------------------
+
+def test_direct_process_start_result_has_exactly_four_keys(
+    monkeypatch, tmp_path: Path
+):
+    """Characterization: _start() in direct-process mode returns exactly {pid, process_group_id, port, mode}."""
+    server = _make_server(tmp_path)
+
+    class FakeProcess:
+        pid = 1234
+
+    monkeypatch.setattr(
+        server,
+        "build_versioned_command_args",
+        lambda default_args, model_path=None, port=None: list(default_args),
+    )
+    monkeypatch.setattr(
+        server,
+        "_get_configured_image",
+        lambda: pytest.fail("direct-process must not resolve container images"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_create_workload",
+        lambda **_kwargs: pytest.fail("direct-process must not create workloads"),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.create_workload",
+        lambda *_args, **_kwargs: pytest.fail("direct-process must bypass create_workload"),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.get_process_group_id", lambda pid: pid + 1
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.shutil.which",
+        lambda *_args, **_kwargs: "/usr/bin/vllm",
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.socket.socket",
+        lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.subprocess.Popen",
+        lambda *_args, **_kwargs: FakeProcess(),
+    )
+
+    result = server._start()
+
+    assert set(result.keys()) == {"pid", "process_group_id", "port", "mode"}
+    assert result["pid"] == 1234
+    assert result["process_group_id"] == 1235
+    assert result["port"] == 8000
+    assert result["mode"] == DIRECT_PROCESS_RUNTIME_MODE
+
+
+def test_direct_process_port_check_failure_raises_runtime_error(
+    monkeypatch, tmp_path: Path
+):
+    """Characterization: port bind failure raises RuntimeError with 'host prerequisites not met'."""
+    server = _make_server(tmp_path)
+
+    class BindFailSocket:
+        def bind(self, address):
+            raise OSError(98, "Address already in use")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.shutil.which",
+        lambda *_args, **_kwargs: "/usr/bin/vllm",
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.socket.socket",
+        lambda *_args, **_kwargs: BindFailSocket(),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("port failure must prevent process spawn"),
+    )
+
+    with pytest.raises(RuntimeError, match="Direct-process vLLM host prerequisites not met"):
+        server._start()
+
+
+def test_direct_process_directory_check_failure_raises_runtime_error(
+    monkeypatch, tmp_path: Path
+):
+    """Characterization: missing required directory raises RuntimeError with 'host prerequisites not met'."""
+    import shutil as _shutil
+
+    # Use a server whose directories do NOT exist
+    server = _make_server(tmp_path)
+    # Remove the serve log directory to trigger directory check failure
+    serve_log_dir = tmp_path / "data" / "log" / "serve"
+    _shutil.rmtree(str(serve_log_dir))
+
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.shutil.which",
+        lambda *_args, **_kwargs: "/usr/bin/vllm",
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.socket.socket",
+        lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("directory failure must prevent process spawn"),
+    )
+
+    with pytest.raises(RuntimeError, match="Direct-process vLLM host prerequisites not met"):
+        server._start()
+
+
+def test_direct_process_vllm_command_starts_with_vllm_serve(
+    monkeypatch, tmp_path: Path
+):
+    """Characterization: direct-process vLLM command always starts with ['vllm', 'serve', <model_path>]."""
+    server = _make_server(tmp_path)
+    observed_args: list = []
+
+    class FakeProcess:
+        pid = 5678
+
+    def fake_popen(args, **kwargs):
+        observed_args.extend(args)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        server,
+        "build_versioned_command_args",
+        lambda default_args, model_path=None, port=None: list(default_args),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.get_process_group_id", lambda pid: pid
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.shutil.which",
+        lambda *_args, **_kwargs: "/usr/bin/vllm",
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.socket.socket",
+        lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr("gpustack.worker.backends.vllm.subprocess.Popen", fake_popen)
+
+    server._start()
+
+    assert observed_args[0] == "vllm"
+    assert observed_args[1] == "serve"
+    assert observed_args[2] == "/models/test-model"
+
+
+def test_direct_process_vllm_mode_constant_value_is_locked():
+    """Characterization: DIRECT_PROCESS_RUNTIME_MODE constant value must be 'direct_process'."""
+    assert DIRECT_PROCESS_RUNTIME_MODE == "direct_process"
