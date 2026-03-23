@@ -812,6 +812,7 @@ async def create_inference_backend(
             default_env=backend_in.default_env,
             enabled=backend_in.enabled,
             backend_source=backend_in.backend_source,
+            supports_direct_process=backend_in.supports_direct_process,
         )
         backend = await InferenceBackend.create(session, backend)
     except Exception as e:
@@ -872,6 +873,7 @@ async def update_inference_backend(
             "description": backend_in.description,
             "default_env": backend_in.default_env,
             "backend_source": backend_in.backend_source,
+            "supports_direct_process": backend_in.supports_direct_process,
         }
         if backend_in.backend_source == BackendSourceEnum.COMMUNITY:
             if backend_in.enabled is not None:
@@ -992,6 +994,7 @@ async def create_inference_backend_from_yaml(
             "default_env",
             "enabled",
             "backend_source",
+            "supports_direct_process",
         ]
         yaml_data = {k: req_yaml_data[k] for k in allowed_keys if k in req_yaml_data}
 
@@ -1076,6 +1079,7 @@ async def update_inference_backend_from_yaml(  # noqa: C901
             "default_env",
             "enabled",
             "backend_source",
+            "supports_direct_process",
         ]
         if not is_built_in_backend(backend.backend_name):
             allowed_keys.append("default_version")

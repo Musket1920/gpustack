@@ -59,6 +59,7 @@ class BackendEnum(str, Enum):
     VOX_BOX = "VoxBox"
     ASCEND_MINDIE = "MindIE"
     SGLANG = "SGLang"
+    LLAMA_CPP = "llama.cpp"
     CUSTOM = "Custom"
 
 
@@ -683,12 +684,12 @@ def is_renaker_model(model: Model):
     return "reranker" in model.categories
 
 
-def get_backend(model: Model) -> str:
+def get_backend(model: Any) -> str:
     if model.backend:
         return model.backend
 
     if is_gguf_model(model):
-        return BackendEnum.CUSTOM
+        return BackendEnum.LLAMA_CPP
 
     return BackendEnum.VLLM
 

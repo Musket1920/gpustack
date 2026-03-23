@@ -21,6 +21,49 @@ class ContainerEnvConfig(BaseModel):
     shm_size_gib: float = 10.0
 
 
+class DirectProcessContract(BaseModel):
+    """
+    Contract describing how to launch a backend as a direct host process
+    instead of inside a container.
+
+    Attributes:
+        command_template: Command template with ``{{port}}``, ``{{model_path}}``,
+            etc. placeholders that will be resolved at launch time.
+        env_template: Optional environment variable template (key→value with
+            placeholder support).
+        health_path: HTTP path used for readiness probes (e.g. ``/health``).
+        startup_timeout_seconds: Maximum seconds to wait for the process to
+            become healthy before declaring failure.
+        stop_signal: OS signal name used to request graceful shutdown
+            (e.g. ``SIGTERM``, ``SIGINT``).  Defaults to ``SIGTERM``.
+        stop_timeout_seconds: Seconds to wait after sending *stop_signal*
+            before force-killing the process.
+        workdir: Optional working directory for the spawned process.
+    """
+
+    command_template: str = Field(
+        ..., description="Command template with placeholder support"
+    )
+    env_template: Optional[Dict[str, str]] = Field(
+        None, description="Environment variable template"
+    )
+    health_path: str = Field(
+        "/health", description="HTTP readiness probe path"
+    )
+    startup_timeout_seconds: int = Field(
+        120, ge=1, description="Max seconds to wait for healthy status"
+    )
+    stop_signal: str = Field(
+        "SIGTERM", description="OS signal for graceful shutdown"
+    )
+    stop_timeout_seconds: int = Field(
+        30, ge=1, description="Seconds before force-kill after stop signal"
+    )
+    workdir: Optional[str] = Field(
+        None, description="Working directory for the spawned process"
+    )
+
+
 class VersionConfig(BaseModel):
     """
     Configuration for a specific version of an inference backend.
@@ -32,6 +75,9 @@ class VersionConfig(BaseModel):
         built_in_frameworks: Only built-in backend will return this field, sourced from gpustack-runner configuration. (Optional)
         custom_framework: User-provided value (upon backend creation) used for deployment and compatibility checks. (Optional)
         env: Environment variables for this version (Optional, merges with default_env)
+        direct_process_contract: Optional contract for launching the backend
+            as a direct host process.  When set, ``image_name`` and
+            ``entrypoint`` may be omitted.
     """
 
     image_name: Optional[str] = Field(None)
@@ -40,6 +86,7 @@ class VersionConfig(BaseModel):
     built_in_frameworks: Optional[List[str]] = Field(None)
     custom_framework: Optional[str] = Field(None)
     env: Optional[Dict[str, str]] = Field(None)
+    direct_process_contract: Optional[DirectProcessContract] = Field(None)
 
 
 class VersionConfigDict(RootModel[Dict[str, VersionConfig]]):
@@ -93,6 +140,16 @@ class InferenceBackendBase(SQLModel):
     default_env: Optional[Dict[str, str]] = SQLField(
         sa_column=Column(JSON), default=None
     )
+    supports_direct_process: Optional[bool] = SQLField(default=None)
+
+    def has_direct_process_contract(self) -> bool:
+        """Return True if any version config declares a direct-process contract."""
+        if not self.version_configs or not self.version_configs.root:
+            return False
+        return any(
+            vc.direct_process_contract is not None
+            for vc in self.version_configs.root.values()
+        )
 
     def resolve_target_version(self, version: Optional[str] = None) -> Optional[str]:
         """
@@ -304,6 +361,7 @@ class InferenceBackendListItem(BaseModel):
     enabled: Optional[bool] = Field(None)
     backend_source: Optional[BackendSourceEnum] = Field(None)
     default_env: Optional[Dict[str, str]] = Field(None)
+    supports_direct_process: Optional[bool] = Field(None)
 
 
 class InferenceBackendResponse(BaseModel):
@@ -341,6 +399,7 @@ def get_built_in_backend() -> List[InferenceBackend]:
             backend_name=BackendEnum.ASCEND_MINDIE.value, is_built_in=True
         ),
         InferenceBackend(backend_name=BackendEnum.VOX_BOX.value, is_built_in=True),
+        InferenceBackend(backend_name=BackendEnum.LLAMA_CPP.value, is_built_in=True),
         InferenceBackend(backend_name=BackendEnum.CUSTOM.value, is_built_in=True),
     ]
 
