@@ -9,6 +9,7 @@ from gpustack.client.worker_manager_clients import (
 )
 from gpustack.config.config import Config
 from gpustack.schemas.workers import (
+    DirectProcessCapabilities,
     WorkerCreate,
     WorkerUpdate,
     WorkerRegistrationPublic,
@@ -17,6 +18,10 @@ from gpustack.schemas.config import PredefinedConfigNoDefaults
 from gpustack.security import API_KEY_PREFIX
 from gpustack.utils import platform
 from gpustack.worker.collector import WorkerStatusCollector
+from gpustack.worker.direct_process import (
+    get_direct_process_supported_backends,
+    get_direct_process_distributed_backends,
+)
 from gpustack.config.registration import (
     registration_client,
     read_worker_token,
@@ -154,6 +159,10 @@ class WorkerManager:
         }
         if getattr(self._cfg, "direct_process_mode", False):
             labels[DIRECT_PROCESS_MODE_LABEL] = "true"
+            # Advertise per-backend direct-process capabilities so the
+            # scheduler/filter layer can make fine-grained decisions.
+            caps = self._build_direct_process_capabilities()
+            labels.update(caps.to_labels())
 
         # worker name label will be set during registration
         name = self._cfg.worker_name or get_worker_name(self._data_dir)
@@ -171,3 +180,19 @@ class WorkerManager:
         if (is_legacy_token or is_legacy_worker) and is_existing_worker:
             labels["gpustack.existence-check"] = "true"
         return labels
+
+    def _build_direct_process_capabilities(self) -> DirectProcessCapabilities:
+        """Build the direct-process capability descriptor from the registries.
+
+        This is called only when ``direct_process_mode`` is enabled.  The
+        returned object is converted to labels via ``to_labels()`` and merged
+        into the worker's label set.
+        """
+        single_backends = sorted(get_direct_process_supported_backends())
+        distributed_backends = sorted(get_direct_process_distributed_backends(self._cfg))
+        return DirectProcessCapabilities(
+            enabled=True,
+            single_worker_backends=single_backends,
+            distributed_backends=distributed_backends,
+            custom_contract_support=True,
+        )

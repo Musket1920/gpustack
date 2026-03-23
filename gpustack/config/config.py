@@ -106,6 +106,7 @@ class Config(WorkerConfig, BaseSettings):
         benchmark_dir: Directory to store benchmark results.
         benchmark_max_duration_seconds: Max duration for a benchmark before timeout. Disabled when unset.
         direct_process_mode: Enable worker direct-process runtime mode.
+        distributed_direct_process_vllm: Enable feature-flagged distributed direct-process scheduling/gating for vLLM workers.
         pipx_path: Path to the pipx executable, used to install versioned backends.
         system_reserved: Reserved system resources.
         tools_download_base_url: Base URL to download dependency tools.

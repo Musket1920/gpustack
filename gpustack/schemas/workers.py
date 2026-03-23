@@ -482,3 +482,111 @@ class WorkerRegistrationPublic(WorkerPublic):
 
 
 WorkersPublic = PaginatedList[WorkerPublic]
+
+
+# ---------------------------------------------------------------------------
+# Direct-process capability advertisement helpers
+#
+# Workers advertise direct-process capabilities through labels (flat
+# Dict[str, str]).  This helper class provides structured access to the
+# capability labels so the scheduler/filter layer does not need to know
+# the raw label keys or parsing rules.
+# ---------------------------------------------------------------------------
+
+DIRECT_PROCESS_BACKENDS_LABEL = "gpustack.direct-process-backends"
+DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL = (
+    "gpustack.direct-process-distributed-backends"
+)
+DIRECT_PROCESS_CUSTOM_CONTRACT_LABEL = "gpustack.direct-process-custom-contract"
+
+
+class DirectProcessCapabilities(BaseModel):
+    """Structured view of a worker's direct-process capability labels.
+
+    This is a read-only helper — not a DB column.  It is built from worker
+    labels at scheduling/filter time and produced by ``WorkerManager`` at
+    registration time.
+    """
+
+    enabled: bool = False
+    """Whether the worker is in direct-process mode at all."""
+
+    single_worker_backends: List[str] = Field(default_factory=list)
+    """Backend names that support single-worker direct-process on this worker."""
+
+    distributed_backends: List[str] = Field(default_factory=list)
+    """Backend names that support distributed (multi-worker) direct-process."""
+
+    custom_contract_support: bool = False
+    """Whether the worker supports the generic custom/community direct-process
+    contract (task 6 will populate this)."""
+
+    # -- factory from raw labels ------------------------------------------
+
+    @classmethod
+    def from_labels(cls, labels: Optional[Dict[str, str]]) -> "DirectProcessCapabilities":
+        """Parse worker labels into a ``DirectProcessCapabilities`` instance.
+
+        Missing or empty labels are treated as *no capability* (fail-safe).
+        """
+        if not labels:
+            return cls()
+
+        from gpustack.worker.worker_manager import DIRECT_PROCESS_MODE_LABEL
+
+        mode_val = labels.get(DIRECT_PROCESS_MODE_LABEL, "")
+        enabled = str(mode_val).lower() in {"1", "true", "yes", "on"}
+        if not enabled:
+            return cls()
+
+        single_raw = labels.get(DIRECT_PROCESS_BACKENDS_LABEL, "")
+        single_backends = [
+            b.strip() for b in single_raw.split(",") if b.strip()
+        ]
+
+        dist_raw = labels.get(DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL, "")
+        distributed_backends = [
+            b.strip() for b in dist_raw.split(",") if b.strip()
+        ]
+
+        custom_val = labels.get(DIRECT_PROCESS_CUSTOM_CONTRACT_LABEL, "")
+        custom_support = str(custom_val).lower() in {"1", "true", "yes", "on"}
+
+        return cls(
+            enabled=True,
+            single_worker_backends=single_backends,
+            distributed_backends=distributed_backends,
+            custom_contract_support=custom_support,
+        )
+
+    # -- convenience queries ----------------------------------------------
+
+    def supports_backend(self, backend: str) -> bool:
+        """Check if this worker supports single-worker direct-process for *backend*."""
+        return self.enabled and backend in self.single_worker_backends
+
+    def supports_distributed_backend(self, backend: str) -> bool:
+        """Check if this worker supports distributed direct-process for *backend*."""
+        return self.enabled and backend in self.distributed_backends
+
+    # -- label production -------------------------------------------------
+
+    def to_labels(self) -> Dict[str, str]:
+        """Produce the flat label dict for worker registration.
+
+        The caller is responsible for merging these into the full label set.
+        The coarse ``gpustack.direct-process-mode`` label is NOT included
+        here — it is managed by the existing ``_ensure_builtin_labels`` path.
+        """
+        labels: Dict[str, str] = {}
+        if self.single_worker_backends:
+            labels[DIRECT_PROCESS_BACKENDS_LABEL] = ",".join(
+                sorted(self.single_worker_backends)
+            )
+        if self.distributed_backends:
+            labels[DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL] = ",".join(
+                sorted(self.distributed_backends)
+            )
+        if self.custom_contract_support:
+            labels[DIRECT_PROCESS_CUSTOM_CONTRACT_LABEL] = "true"
+        return labels

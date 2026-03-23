@@ -72,6 +72,7 @@ class PredefinedConfig(SensitivePredefinedConfig):
     ray_port_range: Optional[str] = "41000-41999"
     benchmark_max_duration_seconds: Optional[int] = None
     direct_process_mode: bool = False
+    distributed_direct_process_vllm: bool = False
     system_reserved: Optional[dict] = None
     pipx_path: Optional[str] = None
     tools_download_base_url: Optional[str] = None

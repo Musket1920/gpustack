@@ -59,6 +59,12 @@ DIRECT_PROCESS_MODE_UNSUPPORTED_BENCHMARK_MESSAGE = (
 DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_MESSAGE = (
     direct_process.DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_MESSAGE
 )
+DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_BACKEND_MESSAGE = (
+    direct_process.DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_BACKEND_MESSAGE
+)
+DIRECT_PROCESS_MODE_DISTRIBUTED_VLLM_DISABLED_MESSAGE = (
+    direct_process.DIRECT_PROCESS_MODE_DISTRIBUTED_VLLM_DISABLED_MESSAGE
+)
 DIRECT_PROCESS_MODE_UNSUPPORTED_PLATFORM_MESSAGE = (
     direct_process.DIRECT_PROCESS_MODE_UNSUPPORTED_PLATFORM_MESSAGE
 )
@@ -126,11 +132,100 @@ def make_benchmark(**kwargs) -> Benchmark:
 
 def test_direct_process_mode_config_env_flag(monkeypatch, tmp_path):
     monkeypatch.setenv("GPUSTACK_DIRECT_PROCESS_MODE", "true")
+    monkeypatch.setenv("GPUSTACK_DISTRIBUTED_DIRECT_PROCESS_VLLM", "true")
 
     cfg = make_config(tmp_path)
 
     assert getattr(cfg, "direct_process_mode") is True
+    assert getattr(cfg, "distributed_direct_process_vllm") is True
     assert parse_base_model_to_env_vars(cfg)["GPUSTACK_DIRECT_PROCESS_MODE"] == "true"
+    assert (
+        parse_base_model_to_env_vars(cfg)["GPUSTACK_DISTRIBUTED_DIRECT_PROCESS_VLLM"]
+        == "true"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Characterization: support-gate constant values are locked
+# ---------------------------------------------------------------------------
+
+def test_direct_process_mode_constant_values_are_locked():
+    """Characterization: exact message strings must not silently change."""
+    assert DIRECT_PROCESS_MODE_UNSUPPORTED_PLATFORM_MESSAGE == (
+        "Direct process mode is supported only on Linux workers."
+    )
+    assert DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_MESSAGE == (
+        "Direct process mode supports only single-worker launches; distributed workers are not supported."
+    )
+    assert DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_BACKEND_MESSAGE == (
+        "Direct process mode supports distributed launches only for the vLLM backend."
+    )
+    assert DIRECT_PROCESS_MODE_DISTRIBUTED_VLLM_DISABLED_MESSAGE == (
+        "Distributed vLLM direct process mode is disabled on this worker."
+    )
+    assert DIRECT_PROCESS_MODE_UNSUPPORTED_SUBORDINATE_MESSAGE == (
+        "Direct process mode supports only single-worker launches on the main worker; subordinate workers are not supported."
+    )
+    assert DIRECT_PROCESS_MODE_UNSUPPORTED_BENCHMARK_MESSAGE == (
+        "Direct process mode does not support benchmarks."
+    )
+
+
+def test_direct_process_mode_disabled_is_noop(monkeypatch, tmp_path):
+    """Characterization: when direct_process_mode=False, all checks are skipped."""
+    cfg = make_config(tmp_path, direct_process_mode=False)
+    mi = make_model_instance()
+
+    # Even on Windows with a non-vLLM backend and distributed servers, no error raised.
+    monkeypatch.setattr(direct_process.platform, "system", lambda: "windows")
+
+    # Should not raise
+    ensure_model_instance_direct_process_support(
+        cfg,
+        mi,
+        BackendEnum.SGLANG,
+        worker_id=99,
+    )
+
+
+def test_direct_process_mode_non_vllm_backend_exact_message(monkeypatch, tmp_path):
+    """Characterization: unsupported backend error message format is locked."""
+    cfg = make_config(tmp_path, direct_process_mode=True)
+    mi = make_model_instance()
+
+    monkeypatch.setattr(direct_process.platform, "system", lambda: "linux")
+
+    with pytest.raises(ValueError, match=r"Direct process mode supports only the Custom, MindIE, SGLang, VoxBox, llama\.cpp, vLLM backend, got 'FakeBackend'\."):
+        ensure_model_instance_direct_process_support(cfg, mi, "FakeBackend", worker_id=1)
+
+
+def test_direct_process_mode_subordinate_check_precedes_distributed_check(
+    monkeypatch, tmp_path
+):
+    """Characterization: worker_id mismatch (subordinate) is checked before distributed check."""
+    cfg = make_config(tmp_path, direct_process_mode=True)
+    # worker_id=2 is a subordinate worker (model_instance.worker_id=1)
+    mi = make_model_instance(
+        distributed_servers=DistributedServers(
+            mode=DistributedServerCoordinateModeEnum.INITIALIZE_LATER,
+            subordinate_workers=[
+                ModelInstanceSubordinateWorker(worker_id=2, worker_ip="127.0.0.2")
+            ],
+        )
+    )
+
+    monkeypatch.setattr(direct_process.platform, "system", lambda: "linux")
+
+    # worker_id=2 means this is a subordinate worker — must get SUBORDINATE message, not DISTRIBUTED
+    with pytest.raises(ValueError, match=DIRECT_PROCESS_MODE_UNSUPPORTED_SUBORDINATE_MESSAGE):
+        ensure_model_instance_direct_process_support(cfg, mi, BackendEnum.VLLM, worker_id=2)
+
+
+def test_direct_process_mode_benchmark_disabled_is_noop(tmp_path):
+    """Characterization: benchmark check is skipped when direct_process_mode=False."""
+    cfg = make_config(tmp_path, direct_process_mode=False)
+    # Should not raise
+    ensure_benchmark_direct_process_support(cfg)
 
 
 def test_direct_process_mode_support_matrix_supported_vllm_linux_single_worker(
@@ -160,11 +255,11 @@ def test_direct_process_mode_support_matrix_supported_vllm_linux_single_worker(
             DIRECT_PROCESS_MODE_UNSUPPORTED_PLATFORM_MESSAGE,
         ),
         (
-            BackendEnum.SGLANG,
+            "FakeBackend",
             1,
             None,
             "linux",
-            "Direct process mode supports only the vLLM backend, got 'SGLang'.",
+            "Direct process mode supports only the Custom, MindIE, SGLang, VoxBox, llama.cpp, vLLM backend, got 'FakeBackend'.",
         ),
         (
             BackendEnum.VLLM,
@@ -176,7 +271,19 @@ def test_direct_process_mode_support_matrix_supported_vllm_linux_single_worker(
                 ],
             ),
             "linux",
-            DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_MESSAGE,
+            DIRECT_PROCESS_MODE_DISTRIBUTED_VLLM_DISABLED_MESSAGE,
+        ),
+        (
+            BackendEnum.SGLANG,
+            1,
+            DistributedServers(
+                mode=DistributedServerCoordinateModeEnum.INITIALIZE_LATER,
+                subordinate_workers=[
+                    ModelInstanceSubordinateWorker(worker_id=2, worker_ip="127.0.0.2")
+                ],
+            ),
+            "linux",
+            DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_BACKEND_MESSAGE,
         ),
         (
             BackendEnum.VLLM,
@@ -191,7 +298,7 @@ def test_direct_process_mode_support_matrix_supported_vllm_linux_single_worker(
             DIRECT_PROCESS_MODE_UNSUPPORTED_SUBORDINATE_MESSAGE,
         ),
     ],
-    ids=["platform", "backend", "distributed", "subordinate"],
+    ids=["platform", "backend", "distributed_vllm_flag_off", "distributed_non_vllm", "subordinate"],
 )
 def test_direct_process_mode_unsupported_model_instance_validation(
     monkeypatch,
@@ -204,6 +311,9 @@ def test_direct_process_mode_unsupported_model_instance_validation(
 ):
     cfg = make_config(tmp_path, direct_process_mode=True)
     mi = make_model_instance(distributed_servers=distributed_servers)
+
+    if message != DIRECT_PROCESS_MODE_DISTRIBUTED_VLLM_DISABLED_MESSAGE:
+        cfg.distributed_direct_process_vllm = True
 
     monkeypatch.setattr(direct_process.platform, "system", lambda: platform_name)
 
@@ -293,26 +403,38 @@ async def test_benchmark_rejected_before_launch_attempt_in_direct_process_mode(
 
 
 @pytest.mark.parametrize(
-    ("worker_id", "message", "patch_key"),
+    ("backend", "distributed_flag", "worker_id", "message", "patch_key"),
     [
         (
+            BackendEnum.VLLM,
+            False,
             1,
-            DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_MESSAGE,
+            DIRECT_PROCESS_MODE_DISTRIBUTED_VLLM_DISABLED_MESSAGE,
             None,
         ),
         (
+            BackendEnum.SGLANG,
+            True,
+            1,
+            DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_BACKEND_MESSAGE,
+            None,
+        ),
+        (
+            BackendEnum.VLLM,
+            True,
             2,
             DIRECT_PROCESS_MODE_UNSUPPORTED_SUBORDINATE_MESSAGE,
             "distributed_servers.subordinate_workers.0",
         ),
     ],
-    ids=["distributed_rejected", "subordinate_rejected"],
+    ids=["distributed_vllm_flag_off", "distributed_non_vllm_rejected", "subordinate_rejected"],
 )
 def test_distributed_rejected_before_launch_attempt_in_direct_process_mode(
-    monkeypatch, tmp_path, worker_id, message, patch_key
+    monkeypatch, tmp_path, backend, distributed_flag, worker_id, message, patch_key
 ):
     serve_manager_module = _import_worker_module("gpustack.worker.serve_manager")
     cfg = make_config(tmp_path, direct_process_mode=True)
+    cfg.distributed_direct_process_vllm = distributed_flag
     mi = make_model_instance(
         distributed_servers=DistributedServers(
             mode=DistributedServerCoordinateModeEnum.INITIALIZE_LATER,
@@ -326,7 +448,7 @@ def test_distributed_rejected_before_launch_attempt_in_direct_process_mode(
     manager._serve_log_dir = str(tmp_path / "serve")
     manager._provisioning_processes = {}
     manager._worker_id_getter = lambda: worker_id
-    manager._get_model = lambda _: make_model()
+    manager._get_model = lambda _: make_model(backend=backend)
 
     updates = []
 

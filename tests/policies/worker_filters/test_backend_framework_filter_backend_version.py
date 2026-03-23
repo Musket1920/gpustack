@@ -1,3 +1,18 @@
+import sys
+import types
+
+# Inject an fcntl stub before importing any gpustack.policies module so that
+# the import chain backend_framework_filter → vllm_resource_fit_selector →
+# ascend_mindie_resource_fit_selector → gpustack.worker.__init__ →
+# gpustack.utils.locks → fcntl does not fail on Windows.
+if "fcntl" not in sys.modules:
+    _fcntl_stub = types.ModuleType("fcntl")
+    _fcntl_stub.LOCK_EX = 1  # type: ignore[attr-defined]
+    _fcntl_stub.LOCK_UN = 2  # type: ignore[attr-defined]
+    _fcntl_stub.lockf = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+    _fcntl_stub.flock = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+    sys.modules["fcntl"] = _fcntl_stub
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

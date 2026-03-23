@@ -6,7 +6,7 @@ from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
 )
 from gpustack.policies.base import WorkerFilter
 from gpustack.schemas.models import Model, get_backend, BackendEnum
-from gpustack.schemas.workers import Worker
+from gpustack.schemas.workers import Worker, DirectProcessCapabilities
 from gpustack.schemas.inference_backend import (
     InferenceBackend,
 )
@@ -24,6 +24,12 @@ DIRECT_PROCESS_MODE_UNSUPPORTED_PLATFORM_MESSAGE = (
 )
 DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_MESSAGE = (
     "Direct process mode supports only single-worker launches; distributed workers are not supported."
+)
+DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_BACKEND_MESSAGE = (
+    "Direct process mode supports distributed launches only for the vLLM backend."
+)
+DIRECT_PROCESS_MODE_DISTRIBUTED_VLLM_DISABLED_MESSAGE = (
+    "Distributed vLLM direct process mode is disabled on this worker."
 )
 DIRECT_PROCESS_MODE_LABEL = "gpustack.direct-process-mode"
 
@@ -66,9 +72,19 @@ class BackendFrameworkFilter(WorkerFilter):
     def _get_direct_process_incompatible_reason(
         self, worker: Worker
     ) -> Optional[str]:
-        if self.backend_name != BackendEnum.VLLM:
+        caps = DirectProcessCapabilities.from_labels(worker.labels)
+
+        if not caps.supports_backend(self.backend_name):
+            advertised = caps.single_worker_backends
+            if advertised:
+                supported_str = ", ".join(sorted(advertised))
+                return (
+                    f"Direct process mode on this worker supports only the "
+                    f"{supported_str} backend(s), got '{self.backend_name}'."
+                )
             return (
-                f"Direct process mode supports only the vLLM backend, got '{self.backend_name}'."
+                f"Worker does not advertise direct-process support for "
+                f"backend '{self.backend_name}'."
             )
 
         if self._get_worker_platform_name(worker) != "linux":
@@ -78,7 +94,10 @@ class BackendFrameworkFilter(WorkerFilter):
             VLLMResourceFitSelector.get_world_size_from_backend_parameters(self.model)
         )
         if requested_world_size and self._get_worker_gpu_count(worker) < requested_world_size:
-            return DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_MESSAGE
+            if self.backend_name != BackendEnum.VLLM:
+                return DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_BACKEND_MESSAGE
+            if not caps.supports_distributed_backend(self.backend_name):
+                return DIRECT_PROCESS_MODE_DISTRIBUTED_VLLM_DISABLED_MESSAGE
 
         return None
 
