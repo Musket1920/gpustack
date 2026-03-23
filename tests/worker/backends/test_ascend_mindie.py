@@ -1,3 +1,17 @@
+import sys
+import types
+
+# Inject an fcntl stub before importing any gpustack.worker module so that
+# gpustack.worker.__init__ -> gpustack.utils.locks -> fcntl does not fail on
+# Windows where fcntl is unavailable.
+if "fcntl" not in sys.modules:
+    _fcntl_stub = types.ModuleType("fcntl")
+    _fcntl_stub.LOCK_EX = 1  # type: ignore[attr-defined]
+    _fcntl_stub.LOCK_UN = 2  # type: ignore[attr-defined]
+    _fcntl_stub.lockf = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+    _fcntl_stub.flock = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+    sys.modules["fcntl"] = _fcntl_stub
+
 import argparse
 
 from gpustack.worker.backends.ascend_mindie import AscendMindIEParameters

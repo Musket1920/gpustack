@@ -3,9 +3,12 @@ import dataclasses
 import json
 import logging
 import os
+import shutil
+import socket
+import subprocess
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from gpustack_runtime.deployer import (
     Container,
@@ -21,6 +24,10 @@ from gpustack_runtime.envs import to_bool
 
 from gpustack.schemas.models import ModelInstanceDeploymentMetadata
 from gpustack.utils.envs import sanitize_env
+from gpustack.worker.process_registry import (
+    DIRECT_PROCESS_RUNTIME_MODE,
+    get_process_group_id,
+)
 from gpustack.worker.backends.base import InferenceServer, is_ascend_310p
 
 logger = logging.getLogger(__name__)
@@ -1034,7 +1041,302 @@ class AscendMindIEServer(InferenceServer):
 
     This backend preserves all the original logic from AscendMindIEServer but runs
     the final service in a Docker container instead of a subprocess.
+
+    When ``direct_process_mode`` is enabled on the worker config, this backend
+    can also launch MindIE as a direct host process instead of inside a
+    container.  Only single-worker deployments are supported in direct-process
+    mode; distributed requests are rejected.
     """
+
+    # ------------------------------------------------------------------
+    # Shared direct-process contract implementation
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def supports_direct_process(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_distributed_direct_process(cls) -> bool:
+        return False
+
+    def build_direct_process_command(self, port: int) -> List[str]:
+        # MindIE uses mindieservice_daemon from the Ascend install path.
+        # In direct-process mode the binary must already be on the host.
+        install_path = self._get_mindie_install_path()
+        return self.build_versioned_command_args(
+            [str(install_path.joinpath("bin", "mindieservice_daemon"))]
+        )
+
+    def build_direct_process_env(self) -> Dict[str, str]:
+        return self._get_configured_env()
+
+    def get_direct_process_health_path(self) -> str:
+        return "/v1/models"
+
+    def preflight_direct_process(
+        self,
+        command_args: List[str],
+        env: Dict[str, str],
+        port: int,
+    ) -> None:
+        return self._preflight_direct_process(
+            command_args=command_args, env=env, port=port
+        )
+
+    def start_direct_process(self):
+        return self._start_direct_process(self._get_deployment_metadata())
+
+    # ------------------------------------------------------------------
+    # Direct-process internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_mindie_install_path() -> Path:
+        """Return the MindIE service install path.
+
+        Defaults to the standard Ascend location.  Tests may override this
+        on the instance to redirect to a temporary directory.
+        """
+        return Path("/usr/local/Ascend").joinpath("mindie", "latest", "mindie-service")
+
+    def _start_direct_process(
+        self,
+        deployment_metadata: ModelInstanceDeploymentMetadata,
+    ) -> Dict[str, int | str | None]:
+        if (
+            deployment_metadata.distributed
+            or deployment_metadata.distributed_leader
+            or deployment_metadata.distributed_follower
+        ):
+            raise ValueError(
+                "Direct-process MindIE does not support distributed launches."
+            )
+
+        port = self._get_serving_port()
+
+        install_path = self._get_mindie_install_path()
+
+        # Build env using the same base as container mode
+        env = self._get_configured_env()
+
+        # Build MindIE JSON config (single-worker, non-distributed)
+        config = self._get_mindie_config_json()
+        server_config = config.get("ServerConfig", {})
+        backend_config = config.get("BackendConfig", {})
+        model_deploy_config = backend_config.get("ModelDeployConfig", {})
+        model_config = model_deploy_config.get("ModelConfig", [{}])[0]
+        schedule_config = backend_config.get("ScheduleConfig", {})
+
+        # Apply essential env vars (same as _start for single-worker)
+        env["MIES_INSTALL_PATH"] = str(install_path)
+        env["MIES_SERVICE_MONITOR_MODE"] = env.pop("MIES_SERVICE_MONITOR_MODE", "1")
+        env["MIES_RECOMPUTE_THRESHOLD"] = env.pop("MIES_RECOMPUTE_THRESHOLD", "0.5")
+        env["MINDIE_LLM_RECOMPUTE_THRESHOLD"] = env.pop(
+            "MINDIE_LLM_RECOMPUTE_THRESHOLD", "0.5"
+        )
+        env["MINDIE_LLM_CONTINUOUS_BATCHING"] = env.pop(
+            "MINDIE_LLM_CONTINUOUS_BATCHING", "1"
+        )
+        env["MINDIE_CHECK_INPUTFILES_PERMISSION"] = "0"
+        env["MINDIE_LLM_FRAMEWORK_BACKEND"] = "ATB"
+        env["NPU_MEMORY_FRACTION"] = env.pop("NPU_MEMORY_FRACTION", "0.8")
+        env["OMP_NUM_THREADS"] = env.pop("OMP_NUM_THREADS", "1")
+        env["SAFETENSORS_FAST_GPU"] = env.pop("SAFETENSORS_FAST_GPU", "1")
+        env["MINDIE_ASYNC_SCHEDULING_ENABLE"] = env.pop(
+            "MINDIE_ASYNC_SCHEDULING_ENABLE", "1"
+        )
+        env["TASK_QUEUE_ENABLE"] = env.pop("TASK_QUEUE_ENABLE", "1")
+        env["CPU_AFFINITY_CONF"] = env.pop("CPU_AFFINITY_CONF", "1")
+        env["ATB_OPERATION_EXECUTE_ASYNC"] = "1"
+        env["ATB_LAYER_INTERNAL_TENSOR_REUSE"] = env.pop(
+            "ATB_LAYER_INTERNAL_TENSOR_REUSE", "1"
+        )
+        env["INF_NAN_MODE_ENABLE"] = env.pop("INF_NAN_MODE_ENABLE", "0")
+        env["ATB_LLM_ENABLE_AUTO_TRANSPOSE"] = env.pop(
+            "ATB_LLM_ENABLE_AUTO_TRANSPOSE", "1"
+        )
+        env["ATB_CONVERT_NCHW_TO_ND"] = env.pop("ATB_CONVERT_NCHW_TO_ND", "1")
+        env["ATB_WORKSPACE_MEM_ALLOC_ALG_TYPE"] = env.pop(
+            "ATB_WORKSPACE_MEM_ALLOC_ALG_TYPE", "3"
+        )
+        env["ATB_WORKSPACE_MEM_ALLOC_GLOBAL"] = env.pop(
+            "ATB_WORKSPACE_MEM_ALLOC_GLOBAL", "1"
+        )
+        env["PYTORCH_NPU_ALLOC_CONF"] = env.pop(
+            "PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True"
+        )
+        # Pop conflict configuration items
+        env.pop("NPU_VISIBLE_DEVICES", "")
+        env.pop("NPU-VISIBLE-DEVICES", "")
+        env.pop("NPU_DEVICE_IDS", "")
+        env.pop("ASCEND_LAUNCH_BLOCKING", "")
+        env.pop("ASCEND_RT_VISIBLE_DEVICES", "")
+        env.pop("MIES_CONTAINER_MANAGEMENT_IP", "")
+        env.pop("WORLD_SIZE", "")
+        env.pop("RANKTABLEFILE", "")
+        env.pop("RANK_TABLE_FILE", "")
+        # Single-worker non-distributed: pop container IP/host IP
+        env.pop("MIES_CONTAINER_IP", "")
+        env.pop("HOST_IP", "")
+
+        # Listening config
+        server_config["ipAddress"] = self._worker.ip
+        server_config.pop("managementIpAddress", None)
+        server_config["allowAllZeroIpListening"] = True
+        server_config["maxLinkNum"] = 1000
+        server_config["port"] = port
+        server_config["managementPort"] = port
+        server_config["metricsPort"] = port
+        server_config["httpsEnabled"] = False
+        server_config["interCommTLSEnabled"] = False
+
+        # Device config (single-worker)
+        backend_config["interNodeTLSEnabled"] = False
+        gpu_indexes = self._model_instance.gpu_indexes or []
+        backend_config["npuDeviceIds"] = [list(range(len(gpu_indexes)))]
+        model_config["worldSize"] = len(gpu_indexes)
+        backend_config["multiNodesInferEnabled"] = False
+
+        # Model config
+        derived_max_seq_len = self._derive_max_model_len(default=8192)
+        max_seq_len = derived_max_seq_len if derived_max_seq_len else 8192
+        if max_seq_len > 8192:
+            max_seq_len = 8192
+        model_deploy_config["maxSeqLen"] = max_seq_len
+        model_deploy_config["maxInputTokenLen"] = max_seq_len
+        model_deploy_config["truncation"] = False
+        schedule_config["maxIterTimes"] = max_seq_len
+        schedule_config["maxPrefillTokens"] = max_seq_len
+        model_config["modelName"] = self._model.name
+        model_config["modelWeightPath"] = self._model_path
+
+        # Write config JSON to disk for direct-process
+        config_dir = install_path.joinpath("conf")
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = str(config_dir.joinpath("config.json"))
+        config_str = json.dumps(config, indent=4, ensure_ascii=False)
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(config_str)
+        env["MIES_CONFIG_JSON_PATH"] = config_path
+
+        command_args = self.build_versioned_command_args(
+            [str(install_path.joinpath("bin", "mindieservice_daemon"))]
+        )
+
+        self._preflight_direct_process(command_args=command_args, env=env, port=port)
+
+        logger.info(f"Starting MindIE direct process: {deployment_metadata.name}")
+        logger.info(
+            f"With arguments: [{' '.join(command_args)}], "
+            f"envs(inconsistent input items mean unchangeable):{os.linesep}"
+            f"{os.linesep.join(f'{k}={v}' for k, v in sorted(sanitize_env(env).items()))}"
+        )
+        logger.info(
+            f"With JSON configuration:{os.linesep}{config_str}"
+        )
+
+        process = subprocess.Popen(
+            command_args,
+            env=env,
+            cwd=str(install_path.joinpath("bin")),
+            stdin=subprocess.DEVNULL,
+            start_new_session=os.name != "nt",
+        )
+
+        logger.info(
+            f"Started MindIE direct process: {deployment_metadata.name}, pid: {process.pid}"
+        )
+        return {
+            "pid": process.pid,
+            "process_group_id": get_process_group_id(process.pid),
+            "port": port,
+            "mode": DIRECT_PROCESS_RUNTIME_MODE,
+        }
+
+    def _preflight_direct_process(
+        self,
+        command_args: List[str],
+        env: Dict[str, str],
+        port: int,
+    ) -> None:
+        failures: List[str] = []
+        executable = command_args[0] if command_args else "mindieservice_daemon"
+
+        self._check_direct_process_command(executable=executable, env=env, failures=failures)
+        self._check_direct_process_directories(failures)
+        self._check_direct_process_port(port=port, failures=failures)
+
+        if failures:
+            message = "; ".join(failures)
+            logger.error(
+                "Direct-process MindIE preflight failed for %s: %s",
+                self._model_instance.name,
+                message,
+            )
+            raise RuntimeError(
+                f"Direct-process MindIE host prerequisites not met: {message}"
+            )
+
+    def _check_direct_process_command(
+        self,
+        executable: str,
+        env: Dict[str, str],
+        failures: List[str],
+    ) -> None:
+        executable_path = Path(executable)
+        if executable_path.is_absolute() or executable_path.parent != Path("."):
+            if executable_path.exists():
+                return
+        elif shutil.which(executable, path=env.get("PATH") or os.environ.get("PATH")):
+            return
+
+        failures.append(
+            f"`{executable}` is not available on PATH or does not exist"
+        )
+
+    def _check_direct_process_directories(self, failures: List[str]) -> None:
+        data_dir = Path(str(self._config.data_dir))
+        log_dir = Path(str(self._config.log_dir))
+        required_dirs: List[Tuple[str, Path]] = [
+            ("data directory", data_dir),
+            ("cache directory", Path(str(self._config.cache_dir))),
+            ("log directory", log_dir),
+            ("serve log directory", log_dir / "serve"),
+            ("direct-process registry directory", data_dir / "worker"),
+        ]
+
+        for label, directory in required_dirs:
+            if not directory.exists():
+                failures.append(f"{label} '{directory}' does not exist")
+                continue
+            if not directory.is_dir():
+                failures.append(f"{label} '{directory}' is not a directory")
+                continue
+            if not os.access(directory, os.W_OK):
+                failures.append(f"{label} '{directory}' is not writable")
+
+    def _check_direct_process_port(self, port: int, failures: List[str]) -> None:
+        host = self._worker.ip
+        if not host:
+            failures.append("worker IP is missing; direct-process readiness requires a bindable host address")
+            return
+
+        if port <= 0 or port > 65535:
+            failures.append(f"serving port '{port}' is invalid")
+            return
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind((host, port))
+        except OSError as exc:
+            failures.append(
+                f"cannot bind direct-process listener to {host}:{port}: {exc}"
+            )
+        finally:
+            sock.close()
+
+    # ------------------------------------------------------------------
 
     def start(self):
         try:
@@ -1046,6 +1348,12 @@ class AscendMindIEServer(InferenceServer):
         logger.info(
             f"Starting Ascend MindIE model instance: {self._model_instance.name}"
         )
+
+        deployment_metadata = self._get_deployment_metadata()
+
+        if getattr(self._config, "direct_process_mode", False):
+            return self._start_direct_process(deployment_metadata)
+
         # Prepare distributed information.
         dservers = self._model_instance.distributed_servers
         subworkers = (
