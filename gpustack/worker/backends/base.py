@@ -1171,6 +1171,8 @@ $@
         artifacts: DirectProcessLaunchArtifacts,
     ) -> Dict[str, str]:
         merged_env = dict(env)
+        if "PATH" not in merged_env and "PATH" in os.environ:
+            merged_env["PATH"] = os.environ["PATH"]
         config_env_artifact = artifacts.prepared_config.get("env_artifact")
         if config_env_artifact != str(artifacts.prepared_env_path):
             raise RuntimeError(

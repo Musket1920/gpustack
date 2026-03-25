@@ -914,6 +914,13 @@ def test_direct_process_bootstrap_materializes_venv_cache_and_generated_artifact
     assert Path(executable_provenance["prepared_path"]).exists()
     assert provisioning_record["artifacts"]["launch"] == str(launch_artifact)
     assert "demo-package==1.0.0" in requirements_lock.read_text(encoding="utf-8")
+    env_contents = env_artifact.read_text(encoding="utf-8")
+    assert "PATH=" in env_contents
+    assert "${PATH}" in env_contents
+    launch_contents = launch_artifact.read_text(encoding="utf-8")
+    assert launch_contents.startswith("#!/usr/bin/env sh\n")
+    if sys.platform != "win32":
+        assert launch_artifact.stat().st_mode & 0o111
 
     install_calls.clear()
     reused = serve_manager_module.ServeManager._prepare_direct_process_bootstrap(

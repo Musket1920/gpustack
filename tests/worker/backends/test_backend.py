@@ -1,5 +1,7 @@
 import sys
 import types
+from pathlib import Path
+from typing import Any, cast
 
 # Inject an fcntl stub before importing any gpustack.worker module so that
 # gpustack.worker.__init__ -> gpustack.utils.locks -> fcntl does not fail on
@@ -64,7 +66,7 @@ async def test_apply_registry_override(
     fallback_registry,
     monkeypatch,
 ):
-    backend = CustomServer.__new__(CustomServer)
+    backend = cast(Any, CustomServer.__new__(CustomServer))
     # CustomServer inherits _apply_registry_override from InferenceServer,
     # and _apply_registry_override accesses self._config.system_default_container_registry.
     # Since we constructed the instance via __new__ (without __init__),
@@ -76,7 +78,7 @@ async def test_apply_registry_override(
 
     assert (
         apply_registry_override_to_image(
-            backend._config, image_name, backend._fallback_registry
+            cast(Any, backend._config), image_name, backend._fallback_registry
         )
         == expect_image_name
     )
@@ -85,7 +87,7 @@ async def test_apply_registry_override(
         backend._config = types.SimpleNamespace(system_default_container_registry=None)
         assert (
             apply_registry_override_to_image(
-                backend._config, image_name, backend._fallback_registry
+                cast(Any, backend._config), image_name, backend._fallback_registry
             )
             == image_name
         )
@@ -161,6 +163,44 @@ async def test_apply_registry_override(
     ],
 )
 def test_flatten_backend_param(backend_parameters, expected):
-    backend = CustomServer.__new__(CustomServer)
+    backend = cast(Any, CustomServer.__new__(CustomServer))
     backend._model = types.SimpleNamespace(backend_parameters=backend_parameters)
     assert backend._flatten_backend_param() == expected
+
+
+def test_merge_direct_process_prepared_env_artifacts_preserves_system_path_tail(
+    monkeypatch, tmp_path: Path
+):
+    backend = cast(Any, CustomServer.__new__(CustomServer))
+    prepared_env_path = tmp_path / "prepared.env"
+    prepared_env_path.write_text(
+        "VIRTUAL_ENV=/tmp/prepared/venv\n"
+        "PATH=/tmp/prepared/bin:/tmp/prepared/venv/bin:${PATH}\n",
+        encoding="utf-8",
+    )
+    prepared_config_path = tmp_path / "prepared-config.json"
+    prepared_provenance_path = tmp_path / "executable-provenance.json"
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    merged_env = backend.merge_direct_process_prepared_env_artifacts(
+        {},
+        cast(
+            Any,
+            types.SimpleNamespace(
+            prepared_config={"env_artifact": str(prepared_env_path)},
+            prepared_env_path=prepared_env_path,
+            prepared_config_path=prepared_config_path,
+            prepared_provenance_path=prepared_provenance_path,
+            manifest_hash="manifest-hash",
+            prepared_environment_id="vllm:0.8.0",
+            prepared_provenance={"prepared_path": "/tmp/prepared/bin/vllm"},
+        ),
+        ),
+    )
+
+    assert merged_env["VIRTUAL_ENV"] == "/tmp/prepared/venv"
+    assert (
+        merged_env["PATH"]
+        == "/tmp/prepared/bin:/tmp/prepared/venv/bin:/usr/bin:/bin"
+    )
+    assert merged_env["GPUSTACK_PREPARED_ENV_ARTIFACT"] == str(prepared_env_path)
