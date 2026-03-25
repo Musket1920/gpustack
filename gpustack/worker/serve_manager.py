@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import multiprocessing
 import signal
 import threading
@@ -9,7 +11,7 @@ import psutil
 import requests
 import setproctitle
 import os
-from typing import Dict, Optional, Set, List, Callable
+from typing import Dict, Optional, Set, List, Callable, cast
 import logging
 
 from gpustack_runtime.deployer import (
@@ -36,6 +38,7 @@ from gpustack.worker.backends.sglang import SGLangServer
 from gpustack.worker.backends.vllm import VLLMServer
 from gpustack.worker.backends.vox_box import VoxBoxServer
 from gpustack.worker.backends.custom import CustomServer
+from gpustack.worker.bootstrap_manager import BootstrapManager
 from gpustack.worker.model_meta import get_meta_from_running_instance
 from gpustack.worker.direct_process import (
     ensure_model_instance_direct_process_support,
@@ -71,6 +74,13 @@ logger = logging.getLogger(__name__)
 _DIRECT_PROCESS_PRIMARY_RUNTIME_NAME = "serve"
 _DIRECT_PROCESS_VLLM_RAY_HEAD_RUNTIME_NAME = "ray-head"
 _DIRECT_PROCESS_VLLM_RAY_WORKER_RUNTIME_NAME = "ray-worker"
+
+
+@dataclass(frozen=True)
+class DirectProcessBootstrapReport:
+    prepared_cache_state: str
+    executable_provenance: Dict[str, object]
+    repair_reason: Optional[str] = None
 
 # Global lock for port assignment to avoid pickle serialization issues
 _port_lock = threading.Lock()
@@ -130,6 +140,7 @@ class ServeManager:
     """
     _model_instance_by_instance_id: Dict[int, ModelInstance] = {}
     _direct_process_registry: Optional[DirectProcessRegistry] = None
+    _bootstrap_manager: Optional[BootstrapManager] = None
 
     _clientset_getter: Callable[[], ClientSet]
     _worker_id_getter: Callable[[], int]
@@ -139,11 +150,13 @@ class ServeManager:
         worker_id_getter: Callable[[], int],
         clientset_getter: Callable[[], ClientSet],
         cfg: Config,
+        bootstrap_manager: Optional[BootstrapManager] = None,
     ):
         self._worker_id_getter = worker_id_getter
         self._config = cfg
         self._serve_log_dir = f"{cfg.log_dir}/serve"
         self._clientset_getter = clientset_getter
+        self._bootstrap_manager = bootstrap_manager
 
         # Instance-level port tracking to avoid conflicts
         self._assigned_ports: Dict[int, Set[int]] = {}
@@ -607,7 +620,7 @@ class ServeManager:
             return
 
         model = self._get_model(mi)
-        backend = get_backend(model)
+        backend = cast(BackendEnum, get_backend(model))
 
         is_main_worker = mi.worker_id == self._worker_id
 
@@ -629,6 +642,10 @@ class ServeManager:
             )
             sw = mi.distributed_servers.subordinate_workers[sw_pos]
 
+        if mi.id is None:
+            raise ValueError("Model instance ID is required")
+
+        bootstrap_failure_state_message: Optional[str] = None
         try:
             ensure_model_instance_direct_process_support(
                 self._config,
@@ -637,8 +654,47 @@ class ServeManager:
                 self._worker_id,
             )
 
+            bootstrap_launch_state_message = ""
             if self._is_direct_process_mode():
-                self._get_direct_process_registry().remove_all_by_model_instance_id(mi.id)
+                self._cleanup_direct_process_runtime(mi=mi)
+                bootstrap_preparing_message = (
+                    "Preparing direct-process bootstrap environment before launch."
+                )
+                self._update_model_instance(
+                    mi.id,
+                    **self._build_model_instance_start_patch(
+                        mi=mi,
+                        is_main_worker=is_main_worker,
+                        sw_pos=sw_pos,
+                        sw=sw,
+                        state_message=bootstrap_preparing_message,
+                    ),
+                )
+                logger.info(
+                    "Preparing direct-process bootstrap environment for model instance %s.",
+                    mi.name,
+                )
+                try:
+                    bootstrap_report = self._prepare_direct_process_bootstrap(
+                        mi,
+                        model,
+                        backend,
+                    )
+                except Exception as e:
+                    bootstrap_failure_state_message = (
+                        "Failed to prepare direct-process bootstrap environment: "
+                        f"{e}"
+                    )
+                    raise
+
+                bootstrap_launch_state_message = self._build_direct_process_launch_state_message(
+                    bootstrap_report
+                )
+                logger.info(
+                    "%s for model instance %s",
+                    bootstrap_launch_state_message,
+                    mi.name,
+                )
 
             self._assign_ports(mi, model, backend)
 
@@ -678,30 +734,15 @@ class ServeManager:
             self._provisioning_processes[mi.id] = process
 
             # Get patch dict for main worker.
-            if is_main_worker:
-                patch_dict = {
-                    "state": ModelInstanceStateEnum.INITIALIZING,
-                    "port": mi.port,
-                    "ports": mi.ports,
-                }
-                if not self._is_direct_process_mode():
-                    patch_dict["pid"] = process.pid
-                else:
-                    patch_dict["pid"] = None
-            # Get patch dict for subordinate worker.
-            else:
-                sw.state = ModelInstanceStateEnum.INITIALIZING
-                # For initialize later mode, the state is set to RUNNING directly,
-                # which means the subordinate worker doesn't need to wait for the main worker to be healthy.
-                if (
-                    mi.distributed_servers.mode
-                    == DistributedServerCoordinateModeEnum.INITIALIZE_LATER
-                ):
-                    sw.state = ModelInstanceStateEnum.RUNNING
-                sw.pid = None if self._is_direct_process_mode() else process.pid
-                patch_dict = {
-                    f"distributed_servers.subordinate_workers.{sw_pos}": sw,
-                }
+            patch_dict = self._build_model_instance_start_patch(
+                mi=mi,
+                is_main_worker=is_main_worker,
+                sw_pos=sw_pos,
+                sw=sw,
+                process_pid=process.pid,
+                state_message=bootstrap_launch_state_message,
+                include_ports=True,
+            )
 
             self._update_model_instance(mi.id, **patch_dict)
             logger.info(
@@ -713,23 +754,40 @@ class ServeManager:
             # Clean up provisioning process if started.
             if mi.id in self._provisioning_processes:
                 self._stop_model_instance(mi)
+            elif self._is_direct_process_mode():
+                self._cleanup_direct_process_runtime(mi=mi)
+
+            failure_state_message = bootstrap_failure_state_message or (
+                f"Failed to start model instance: {e}"
+            )
 
             # Get patch dict for main worker.
             if is_main_worker:
                 patch_dict = {
                     "state": ModelInstanceStateEnum.ERROR,
-                    "state_message": f"Failed to start model instance: {e}",
+                    "state_message": failure_state_message,
                 }
             # Get patch dict for subordinate worker.
             else:
+                if sw is None or sw_pos is None:
+                    raise ValueError(
+                        "Subordinate worker context is required for start failure handling"
+                    )
                 sw.state = ModelInstanceStateEnum.ERROR
-                sw.state_message = f"Failed to start model instance: {e}"
+                sw.state_message = failure_state_message
                 patch_dict = {
                     f"distributed_servers.subordinate_workers.{sw_pos}": sw,
                 }
 
             self._update_model_instance(mi.id, **patch_dict)
-            logger.error(f"Failed to start model instance {mi.name}: {e}")
+            if bootstrap_failure_state_message:
+                logger.exception(
+                    "Direct-process bootstrap preparation failed for model instance %s: %s",
+                    mi.name,
+                    e,
+                )
+            else:
+                logger.error(f"Failed to start model instance {mi.name}: {e}")
 
     def _assign_ports(
         self,
@@ -873,6 +931,7 @@ class ServeManager:
                 mi.id
             )
             self._terminate_direct_process_entries(direct_process_entries)
+            self._cleanup_direct_process_bootstrap(mi=mi)
         else:
             # Delete workload.
             deployment_metadata = mi.get_deployment_metadata(self._worker_id)
@@ -910,6 +969,9 @@ class ServeManager:
             )
             removed_entries = registry.remove_all_by_model_instance_id(entry.model_instance_id)
             self._terminate_direct_process_entries(removed_entries or [entry])
+            self._cleanup_direct_process_bootstrap(
+                model_instance_id=entry.model_instance_id
+            )
 
     def _restart_error_model_instance(self, mi: ModelInstance):
         """
@@ -1024,12 +1086,15 @@ class ServeManager:
         if not model.backend_version:
             model = self._refresh_model(model_instance)
 
-        backend = get_backend(model)
+        backend = cast(BackendEnum, get_backend(model))
         runtime_entries = registry.list_by_model_instance_id(model_instance.id)
-        if self._is_distributed_direct_process_vllm(model_instance, backend):
-            self._sync_distributed_direct_process_vllm(
+        if self._is_distributed_direct_process_coordinated_backend(
+            model_instance, backend
+        ):
+            self._sync_distributed_direct_process_coordinated_runtime(
                 model_instance=model_instance,
                 model=model,
+                backend=backend,
                 runtime_entries=runtime_entries,
                 is_main_worker=is_main_worker,
             )
@@ -1071,24 +1136,32 @@ class ServeManager:
             if patch_dict:
                 self._update_model_instance(model_instance.id, **patch_dict)
 
-    def _sync_distributed_direct_process_vllm(
+    def _sync_distributed_direct_process_coordinated_runtime(
         self,
         model_instance: ModelInstance,
         model: Model,
+        backend: BackendEnum,
         runtime_entries: List[DirectProcessRegistryEntry],
         is_main_worker: bool,
     ) -> None:
-        backend = BackendEnum.VLLM
         runtime_names = self._expected_direct_process_runtime_names(
             model_instance, backend, is_main_worker
         )
+        subordinate_workers = (
+            model_instance.distributed_servers.subordinate_workers
+            if model_instance.distributed_servers
+            else []
+        ) or []
         entry_by_name = {entry.runtime_name: entry for entry in runtime_entries}
 
-        primary_runtime_name = (
-            _DIRECT_PROCESS_PRIMARY_RUNTIME_NAME
-            if is_main_worker
-            else _DIRECT_PROCESS_VLLM_RAY_WORKER_RUNTIME_NAME
-        )
+        if backend == BackendEnum.VLLM:
+            primary_runtime_name = (
+                _DIRECT_PROCESS_PRIMARY_RUNTIME_NAME
+                if is_main_worker
+                else _DIRECT_PROCESS_VLLM_RAY_WORKER_RUNTIME_NAME
+            )
+        else:
+            primary_runtime_name = _DIRECT_PROCESS_PRIMARY_RUNTIME_NAME
 
         primary_entry = entry_by_name.get(primary_runtime_name)
         missing_runtime_name = next(
@@ -1110,13 +1183,20 @@ class ServeManager:
                 is_ready=False,
             )
             if is_main_worker:
-                patch_dict = self._build_direct_process_main_worker_patch(
-                    model_instance=model_instance,
-                    entry=primary_entry,
-                    transition_ready=False,
-                    transition_status=transition,
-                    model=model,
-                    backend=backend,
+                patch_dict = (
+                    self._build_distributed_direct_process_local_runtime_failure_patch(
+                        model_instance=model_instance,
+                        entry=primary_entry,
+                        backend=backend,
+                    )
+                    or self._build_direct_process_main_worker_patch(
+                        model_instance=model_instance,
+                        entry=primary_entry,
+                        transition_ready=False,
+                        transition_status=transition,
+                        model=model,
+                        backend=backend,
+                    )
                 )
             else:
                 patch_dict = self._build_direct_process_subordinate_patch(
@@ -1149,13 +1229,20 @@ class ServeManager:
                 is_ready=False,
             )
             if is_main_worker:
-                patch_dict = self._build_direct_process_main_worker_patch(
-                    model_instance=model_instance,
-                    entry=unhealthy_entry,
-                    transition_ready=False,
-                    transition_status=transition,
-                    model=model,
-                    backend=backend,
+                patch_dict = (
+                    self._build_distributed_direct_process_local_runtime_failure_patch(
+                        model_instance=model_instance,
+                        entry=unhealthy_entry,
+                        backend=backend,
+                    )
+                    or self._build_direct_process_main_worker_patch(
+                        model_instance=model_instance,
+                        entry=unhealthy_entry,
+                        transition_ready=False,
+                        transition_status=transition,
+                        model=model,
+                        backend=backend,
+                    )
                 )
             else:
                 patch_dict = self._build_direct_process_subordinate_patch(
@@ -1172,7 +1259,7 @@ class ServeManager:
             subordinate_error = next(
                 (
                     sw
-                    for sw in (model_instance.distributed_servers.subordinate_workers or [])
+                    for sw in subordinate_workers
                     if sw.state == ModelInstanceStateEnum.ERROR
                 ),
                 None,
@@ -1198,7 +1285,7 @@ class ServeManager:
         if is_main_worker:
             ready = ready and all(
                 sw.state == ModelInstanceStateEnum.RUNNING
-                for sw in (model_instance.distributed_servers.subordinate_workers or [])
+                for sw in subordinate_workers
             )
 
         transition = map_direct_process_state_transition(
@@ -1247,14 +1334,19 @@ class ServeManager:
         )
         return subordinate.state if subordinate else ModelInstanceStateEnum.PENDING
 
-    def _is_distributed_direct_process_vllm(
+    def _is_distributed_direct_process_coordinated_backend(
         self,
         model_instance: ModelInstance,
         backend: BackendEnum,
     ) -> bool:
         return (
             self._is_direct_process_mode()
-            and backend == BackendEnum.VLLM
+            and backend
+            in {
+                BackendEnum.VLLM,
+                BackendEnum.SGLANG,
+                BackendEnum.ASCEND_MINDIE,
+            }
             and bool(
                 model_instance.distributed_servers
                 and model_instance.distributed_servers.subordinate_workers
@@ -1267,20 +1359,631 @@ class ServeManager:
         backend: BackendEnum,
         is_main_worker: bool,
     ) -> Set[str]:
-        if not self._is_distributed_direct_process_vllm(model_instance, backend):
+        if not self._is_distributed_direct_process_coordinated_backend(
+            model_instance, backend
+        ):
             return {_DIRECT_PROCESS_PRIMARY_RUNTIME_NAME}
-        if is_main_worker:
+        if backend == BackendEnum.VLLM and is_main_worker:
             return {
                 _DIRECT_PROCESS_PRIMARY_RUNTIME_NAME,
                 _DIRECT_PROCESS_VLLM_RAY_HEAD_RUNTIME_NAME,
             }
-        return {_DIRECT_PROCESS_VLLM_RAY_WORKER_RUNTIME_NAME}
+        if backend == BackendEnum.VLLM:
+            return {_DIRECT_PROCESS_VLLM_RAY_WORKER_RUNTIME_NAME}
+        return {_DIRECT_PROCESS_PRIMARY_RUNTIME_NAME}
 
     def _cleanup_distributed_direct_process_runtime(self, model_instance_id: int) -> None:
-        entries = self._get_direct_process_registry().remove_all_by_model_instance_id(
-            model_instance_id
+        self._cleanup_direct_process_runtime(model_instance_id=model_instance_id)
+
+    def _build_distributed_direct_process_local_runtime_failure_patch(
+        self,
+        *,
+        model_instance: ModelInstance,
+        entry: Optional[DirectProcessRegistryEntry],
+        backend: BackendEnum,
+    ) -> Dict[str, object]:
+        if backend != BackendEnum.ASCEND_MINDIE:
+            return {}
+
+        patch_dict: Dict[str, object] = {}
+        if entry and model_instance.pid != entry.pid:
+            patch_dict["pid"] = entry.pid
+
+        patch_dict.update(
+            {
+                "state": ModelInstanceStateEnum.ERROR,
+                "state_message": (
+                    "Distributed MindIE runtime missing or unhealthy on the current worker."
+                ),
+            }
         )
-        self._terminate_direct_process_entries(entries)
+        return patch_dict
+
+    def _cleanup_direct_process_runtime(
+        self,
+        *,
+        mi: Optional[ModelInstance] = None,
+        model_instance_id: Optional[int] = None,
+    ) -> None:
+        runtime_model_instance_id = model_instance_id or (mi.id if mi else None)
+        if runtime_model_instance_id is not None:
+            entries = self._get_direct_process_registry().remove_all_by_model_instance_id(
+                runtime_model_instance_id
+            )
+            self._terminate_direct_process_entries(entries)
+
+        self._cleanup_direct_process_bootstrap(
+            mi=mi,
+            model_instance_id=runtime_model_instance_id,
+        )
+        self._cleanup_model_instance_runtime_state(runtime_model_instance_id)
+
+    def _cleanup_model_instance_runtime_state(self, model_instance_id: Optional[int]) -> None:
+        if model_instance_id is None:
+            return
+
+        self._provisioning_processes.pop(model_instance_id, None)
+        self._assigned_ports.pop(model_instance_id, None)
+        self._error_model_instances.pop(model_instance_id, None)
+        self._model_cache_by_instance.pop(model_instance_id, None)
+        self._model_instance_by_instance_id.pop(model_instance_id, None)
+
+    def _get_bootstrap_manager(self) -> BootstrapManager:
+        manager = self._bootstrap_manager
+        if manager is None:
+            manager = BootstrapManager(self._config)
+            self._bootstrap_manager = manager
+        return manager
+
+    def _prepare_direct_process_bootstrap(
+        self,
+        model_instance: ModelInstance,
+        model: Model,
+        backend,
+    ) -> DirectProcessBootstrapReport:
+        if model_instance.model_id is None or model_instance.id is None:
+            raise ValueError("Model instance deployment identity is required")
+
+        backend_name = str(backend)
+        backend_version = model.backend_version or "unknown"
+        server_cls = _SERVER_CLASS_MAPPING.get(backend, CustomServer)
+        recipe_id = server_cls.get_direct_process_bootstrap_recipe_id()
+        prepared_environment_id = (
+            server_cls.build_direct_process_prepared_environment_identity(backend_version)
+        )
+        deployment_id = model_instance.model_id
+        runtime_model_instance_id = model_instance.id
+        bootstrap_manager = self._get_bootstrap_manager()
+        expected_identity = bootstrap_manager.prepared_environment_identity(
+            backend_name=backend_name,
+            backend_version=backend_version,
+            recipe_id=recipe_id,
+            prepared_environment_id=prepared_environment_id,
+        )
+        expected_prepared_cache_record = bootstrap_manager.build_prepared_cache_record(
+            expected_identity
+        )
+        prepared_cache_root = bootstrap_manager.prepared_cache_root(
+            backend_name,
+            backend_version,
+        )
+        prepared_cache_context_path = bootstrap_manager.prepared_cache_context_path(
+            backend_name,
+            backend_version,
+        )
+        prepared_cache_exists = prepared_cache_root.is_dir()
+        prepared_cache_state = "initialized"
+        repair_reason: Optional[str] = None
+        if prepared_cache_exists:
+            validation_error = self._validate_prepared_cache_record(
+                path=prepared_cache_context_path,
+                expected_record=expected_prepared_cache_record,
+            )
+            if validation_error is not None:
+                invalid_record = bootstrap_manager.build_prepared_cache_record(
+                    expected_identity,
+                    invalidation_state="invalid",
+                    invalidation_reason=validation_error,
+                )
+                bootstrap_manager.prepare_prepared_cache_root(backend_name, backend_version)
+                self._write_bootstrap_json_file(prepared_cache_context_path, invalid_record)
+                raise RuntimeError(
+                    "Prepared direct-process bootstrap cache is invalid: "
+                    f"{validation_error}"
+                )
+
+            repair_reason = bootstrap_manager.prepared_cache_repair_reason(
+                backend_name,
+                backend_version,
+            )
+            if repair_reason is not None:
+                audit_events = [
+                    bootstrap_manager._build_audit_event(
+                        operation="repair",
+                        outcome="requested",
+                        reason=repair_reason,
+                        details={
+                            "policy": "prepared-cache-local-only",
+                            "scope": "prepared-cache",
+                        },
+                    )
+                ]
+                bootstrap_manager.cleanup_prepared_cache_root(
+                    backend_name,
+                    backend_version,
+                )
+                prepared_cache_root = bootstrap_manager.materialize_recipe_prepared_cache(
+                    backend_name,
+                    backend_version,
+                    expected_prepared_cache_record,
+                    audit_events=audit_events,
+                )
+                self._write_bootstrap_json_file(
+                    prepared_cache_context_path,
+                    expected_prepared_cache_record,
+                )
+                prepared_cache_state = "repaired"
+                prepared_cache_exists = False
+            else:
+                prepared_cache_state = "reused"
+
+        if not prepared_cache_exists and hasattr(
+            bootstrap_manager, "materialize_recipe_prepared_cache"
+        ):
+            prepared_cache_root = bootstrap_manager.materialize_recipe_prepared_cache(
+                backend_name,
+                backend_version,
+                expected_prepared_cache_record,
+            )
+        else:
+            prepared_cache_root = bootstrap_manager.prepare_prepared_cache_root(
+                backend_name,
+                backend_version,
+            )
+
+        if not prepared_cache_exists:
+            self._write_bootstrap_json_file(
+                prepared_cache_context_path,
+                expected_prepared_cache_record,
+            )
+
+        bootstrap_manager.prepare_runtime_roots(deployment_id, runtime_model_instance_id)
+
+        identity_payload = {
+            "deployment_id": deployment_id,
+            "model_id": getattr(model, "id", deployment_id),
+            "model_instance_id": runtime_model_instance_id,
+            "model_name": model.name,
+            "model_instance_name": model_instance.name,
+        }
+        ownership_payload = {
+            "prepared_cache_root": {
+                "owner_scope": "backend-version",
+                "owner_reference": prepared_environment_id or backend_name,
+                "prepared_by": "bootstrap",
+                "runtime_authority": "ServeManager/process_registry",
+                "path": str(prepared_cache_root),
+                "state_path": str(prepared_cache_context_path),
+            },
+            "runtime_roots": {
+                "owner_scope": "deployment-model-instance",
+                "owner_reference": (
+                    f"deployment:{deployment_id}/model-instance:{runtime_model_instance_id}"
+                ),
+                "prepared_by": "bootstrap",
+                "runtime_authority": "ServeManager/process_registry",
+                "workspace_path": str(
+                    bootstrap_manager.workspace_path(
+                        deployment_id,
+                        runtime_model_instance_id,
+                    )
+                ),
+                "artifact_path": str(
+                    bootstrap_manager.artifact_path(
+                        deployment_id,
+                        runtime_model_instance_id,
+                    )
+                ),
+                "manifest_path": str(
+                    bootstrap_manager.manifest_path(
+                        deployment_id,
+                        runtime_model_instance_id,
+                    )
+                ),
+                "lock_path": str(
+                    bootstrap_manager.lock_path(
+                        deployment_id,
+                        runtime_model_instance_id,
+                    )
+                ),
+            },
+        }
+        prepared_artifacts_payload = {
+            "prepared_cache_context": str(prepared_cache_context_path),
+            "env": str(
+                bootstrap_manager.prepared_cache_artifact_path(
+                    backend_name,
+                    backend_version,
+                    bootstrap_manager.PREPARED_CACHE_ENV_FILENAME,
+                )
+            ),
+            "config": str(
+                bootstrap_manager.prepared_cache_artifact_path(
+                    backend_name,
+                    backend_version,
+                    bootstrap_manager.PREPARED_CACHE_CONFIG_FILENAME,
+                )
+            ),
+            "launch": str(
+                bootstrap_manager.prepared_cache_artifact_path(
+                    backend_name,
+                    backend_version,
+                    bootstrap_manager.PREPARED_CACHE_LAUNCH_FILENAME,
+                )
+            ),
+            "executable_provenance": str(
+                bootstrap_manager.prepared_cache_artifact_path(
+                    backend_name,
+                    backend_version,
+                    bootstrap_manager.PREPARED_CACHE_EXECUTABLE_PROVENANCE_FILENAME,
+                )
+            ),
+            "provisioning_audit": str(
+                bootstrap_manager.prepared_cache_artifact_path(
+                    backend_name,
+                    backend_version,
+                    bootstrap_manager.PREPARED_CACHE_PROVISIONING_FILENAME,
+                )
+            ),
+        }
+        executable_provenance_payload = self._read_bootstrap_json_file(
+            bootstrap_manager.prepared_cache_artifact_path(
+                backend_name,
+                backend_version,
+                bootstrap_manager.PREPARED_CACHE_EXECUTABLE_PROVENANCE_FILENAME,
+            ),
+            "prepared direct-process executable provenance artifact",
+        )
+        launch_provenance_payload = {
+            "launch_state": "launching",
+            "ready": False,
+            "prepared_cache_state": prepared_cache_state,
+            "repair_reason": repair_reason,
+            "executable_provenance": executable_provenance_payload,
+            "provisioning_audit_artifact": prepared_artifacts_payload[
+                "provisioning_audit"
+            ],
+        }
+        bootstrap_payload = {
+            "backend": backend_name,
+            "backend_version": backend_version,
+            "recipe_id": recipe_id,
+            "prepared_environment_id": prepared_environment_id,
+            "resolver_version": expected_identity.resolver_version,
+            "python_identity": expected_identity.python_identity,
+            "manifest_hash": expected_prepared_cache_record["manifest_hash"],
+            "invalidation": expected_prepared_cache_record["invalidation"],
+            "bootstrap_stage": "prepare",
+            "bootstrap_scope": "preparatory-only",
+            "prepared_cache_state": prepared_cache_state,
+            "identity": identity_payload,
+            "ownership": ownership_payload,
+            "prepared_artifacts": prepared_artifacts_payload,
+            "launch_provenance": launch_provenance_payload,
+        }
+
+        self._write_bootstrap_json_file(
+            bootstrap_manager.manifest_path(
+                deployment_id,
+                runtime_model_instance_id,
+                bootstrap_manager.BOOTSTRAP_MANIFEST_FILENAME,
+            ),
+            bootstrap_payload,
+        )
+        self._write_bootstrap_json_file(
+            bootstrap_manager.artifact_path(
+                deployment_id,
+                runtime_model_instance_id,
+                bootstrap_manager.BOOTSTRAP_ARTIFACT_FILENAME,
+            ),
+            {
+                "artifact": "direct-process-bootstrap-context",
+                "backend": backend_name,
+                "backend_version": backend_version,
+                "recipe_id": recipe_id,
+                "prepared_environment_id": prepared_environment_id,
+                "resolver_version": expected_identity.resolver_version,
+                "python_identity": expected_identity.python_identity,
+                "manifest_hash": expected_prepared_cache_record["manifest_hash"],
+                "invalidation": expected_prepared_cache_record["invalidation"],
+                "identity": identity_payload,
+                "ownership": ownership_payload,
+                "prepared_artifacts": prepared_artifacts_payload,
+                "launch_provenance": launch_provenance_payload,
+            },
+        )
+        self._write_bootstrap_text_file(
+            bootstrap_manager.workspace_path(
+                deployment_id,
+                runtime_model_instance_id,
+                bootstrap_manager.BOOTSTRAP_CONTEXT_FILENAME,
+            ),
+            "\n".join(
+                [
+                    *(
+                        [
+                            f"cache_invalidation_state={cast(dict[str, object], expected_prepared_cache_record['invalidation'])['state']}"
+                        ]
+                    ),
+                    "direct-process bootstrap context",
+                    "bootstrap_stage=prepare",
+                    "bootstrap_scope=preparatory-only",
+                    f"backend={backend_name}",
+                    f"backend_version={backend_version}",
+                    f"recipe_id={recipe_id or ''}",
+                    f"prepared_environment_id={prepared_environment_id or ''}",
+                    f"resolver_version={expected_identity.resolver_version}",
+                    f"manifest_hash={expected_prepared_cache_record['manifest_hash']}",
+                    f"python_implementation={expected_identity.python_identity['implementation']}",
+                    f"python_version={expected_identity.python_identity['version']}",
+                    f"python_executable={expected_identity.python_identity['executable']}",
+                    f"deployment_id={deployment_id}",
+                    f"model_id={getattr(model, 'id', deployment_id)}",
+                    f"model_instance_id={runtime_model_instance_id}",
+                    f"model_name={model.name}",
+                    f"model_instance_name={model_instance.name}",
+                    "launch_state=launching",
+                    "launch_ready_state=not-ready",
+                    f"prepared_cache_state={prepared_cache_state}",
+                    f"repair_reason={repair_reason or ''}",
+                    f"executable_provenance_state={executable_provenance_payload.get('state', '')}",
+                    f"executable_provenance_prepared_path={executable_provenance_payload.get('prepared_path', '') or ''}",
+                    f"executable_provenance_source_path={executable_provenance_payload.get('source_path', '') or ''}",
+                    f"executable_provenance_sha256={executable_provenance_payload.get('sha256', '') or ''}",
+                    "prepared_cache_owner_scope=backend-version",
+                    "runtime_root_owner_scope=deployment-model-instance",
+                    "runtime_authority=ServeManager/process_registry",
+                ]
+            )
+            + "\n",
+        )
+        self._write_bootstrap_text_file(
+            bootstrap_manager.lock_path(
+                deployment_id,
+                runtime_model_instance_id,
+                bootstrap_manager.BOOTSTRAP_LOCK_FILENAME,
+            ),
+            "\n".join(
+                [
+                    "direct-process bootstrap lock context",
+                    "bootstrap_stage=prepare",
+                    "lock_owner=bootstrap-preparation",
+                    "runtime_authority=ServeManager/process_registry",
+                    f"backend={backend_name}",
+                    f"backend_version={backend_version}",
+                    f"recipe_id={recipe_id or ''}",
+                    f"prepared_environment_id={prepared_environment_id or ''}",
+                    f"manifest_hash={expected_prepared_cache_record['manifest_hash']}",
+                    f"deployment_id={deployment_id}",
+                    f"model_instance_id={runtime_model_instance_id}",
+                ]
+            )
+            + "\n",
+        )
+        return DirectProcessBootstrapReport(
+            prepared_cache_state=prepared_cache_state,
+            executable_provenance=executable_provenance_payload,
+            repair_reason=repair_reason,
+        )
+
+    @staticmethod
+    def _read_bootstrap_json_file(path, label: str) -> Dict[str, object]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"{label} is unreadable at {path}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{label} at {path} must be a JSON object")
+        return payload
+
+    @staticmethod
+    def _build_direct_process_launch_state_message(
+        bootstrap_report: DirectProcessBootstrapReport,
+    ) -> str:
+        prepared_cache_phrase = {
+            "initialized": "Prepared",
+            "reused": "Reusing",
+            "repaired": "Repaired",
+        }.get(bootstrap_report.prepared_cache_state, "Prepared")
+        provenance_state = str(
+            bootstrap_report.executable_provenance.get("state", "unknown")
+        )
+        return (
+            f"{prepared_cache_phrase} direct-process bootstrap environment; "
+            f"executable provenance: {provenance_state}; "
+            "launching inference server (waiting for readiness)."
+        )
+
+    @staticmethod
+    def _validate_prepared_cache_record(
+        *,
+        path,
+        expected_record: Dict[str, object],
+    ) -> Optional[str]:
+        if not path.exists():
+            return "prepared cache metadata missing"
+
+        try:
+            observed_record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"prepared cache metadata unreadable ({exc})"
+
+        invalidation = observed_record.get("invalidation")
+        if not isinstance(invalidation, dict):
+            return "prepared cache invalidation state missing"
+
+        if invalidation.get("state") != "valid":
+            return (
+                "prepared cache invalidation state is "
+                f"{invalidation.get('state')!r}"
+            )
+
+        expected_manifest_hash = expected_record.get("manifest_hash")
+        observed_manifest_hash = observed_record.get("manifest_hash")
+        if observed_manifest_hash != expected_manifest_hash:
+            return (
+                "prepared cache manifest hash mismatch "
+                f"(expected {expected_manifest_hash}, found {observed_manifest_hash})"
+            )
+
+        for key in (
+            "recipe_id",
+            "backend_version",
+            "resolver_version",
+            "python_identity",
+            "prepared_environment_id",
+        ):
+            if observed_record.get(key) != expected_record.get(key):
+                return (
+                    f"prepared cache {key} mismatch "
+                    f"(expected {expected_record.get(key)!r}, found {observed_record.get(key)!r})"
+                )
+
+        return None
+
+    @staticmethod
+    def _write_bootstrap_json_file(path, payload: Dict[str, object]) -> None:
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_bootstrap_text_file(path, content: str) -> None:
+        path.write_text(content, encoding="utf-8")
+
+    def _build_model_instance_start_patch(
+        self,
+        *,
+        mi: ModelInstance,
+        is_main_worker: bool,
+        sw_pos: Optional[int],
+        sw: Optional[ModelInstanceSubordinateWorker],
+        process_pid: Optional[int] = None,
+        state_message: str = "",
+        include_ports: bool = False,
+    ) -> Dict[str, object]:
+        if is_main_worker:
+            patch_dict: Dict[str, object] = {
+                "state": ModelInstanceStateEnum.INITIALIZING,
+                "state_message": state_message,
+            }
+            if include_ports:
+                patch_dict.update(
+                    {
+                        "port": mi.port,
+                        "ports": mi.ports,
+                    }
+                )
+            patch_dict["pid"] = (
+                None if self._is_direct_process_mode() else process_pid
+            )
+            return patch_dict
+
+        if sw is None or sw_pos is None:
+            return {}
+        if mi.distributed_servers is None:
+            return {}
+
+        sw.state = ModelInstanceStateEnum.INITIALIZING
+        # For initialize later mode, the state is set to RUNNING directly,
+        # which means the subordinate worker doesn't need to wait for the main worker to be healthy.
+        if (
+            mi.distributed_servers.mode
+            == DistributedServerCoordinateModeEnum.INITIALIZE_LATER
+        ):
+            sw.state = ModelInstanceStateEnum.RUNNING
+            sw.state_message = ""
+        else:
+            sw.state_message = state_message
+        sw.pid = None if self._is_direct_process_mode() else process_pid
+        return {
+            f"distributed_servers.subordinate_workers.{sw_pos}": sw,
+        }
+
+    def _cleanup_direct_process_bootstrap(
+        self,
+        *,
+        mi: Optional[ModelInstance] = None,
+        model_instance_id: Optional[int] = None,
+    ) -> None:
+        model_instance = mi or self._resolve_model_instance_for_bootstrap(model_instance_id)
+        if model_instance is None:
+            return
+        if model_instance.model_id is None or model_instance.id is None:
+            logger.debug(
+                "Skipping bootstrap runtime cleanup for model instance %s because deployment identity is incomplete.",
+                model_instance_id or model_instance.id,
+            )
+            return
+
+        bootstrap_manager = self._get_bootstrap_manager()
+        model = self._model_cache_by_instance.get(model_instance.id)
+        if model is None:
+            with contextlib.suppress(Exception):
+                model = self._get_model(model_instance)
+
+        if model is not None and getattr(model, "backend_version", None):
+            backend_name = str(get_backend(model))
+            with contextlib.suppress(Exception):
+                bootstrap_manager.record_prepared_cache_audit_event(
+                    backend_name,
+                    cast(str, model.backend_version),
+                    operation="cleanup",
+                    outcome="runtime-roots-removed",
+                    details={
+                        "deployment_id": model_instance.model_id,
+                        "model_instance_id": model_instance.id,
+                    },
+                )
+
+        bootstrap_manager.cleanup_runtime_roots(
+            model_instance.model_id,
+            model_instance.id,
+        )
+
+    def _resolve_model_instance_for_bootstrap(
+        self,
+        model_instance_id: Optional[int],
+    ) -> Optional[ModelInstance]:
+        if model_instance_id is None:
+            return None
+
+        cached_instance = self._model_instance_by_instance_id.get(model_instance_id)
+        if cached_instance is not None:
+            return cached_instance
+
+        model_instances_api = self._clientset.model_instances
+        get_model_instance = getattr(model_instances_api, "get", None)
+        with contextlib.suppress(NotFoundException):
+            if callable(get_model_instance):
+                return ModelInstance.model_validate(
+                    get_model_instance(id=model_instance_id)
+                )
+
+        list_model_instances = getattr(model_instances_api, "list", None)
+        if callable(list_model_instances):
+            with contextlib.suppress(NotFoundException):
+                model_instances_page = list_model_instances()
+                for item in getattr(model_instances_page, "items", []):
+                    if getattr(item, "id", None) == model_instance_id:
+                        return ModelInstance.model_validate(item)
+
+        logger.debug(
+            "Skipping bootstrap runtime cleanup for model instance %s because it no longer exists.",
+            model_instance_id,
+        )
+        return None
 
     def _build_direct_process_main_worker_patch(
         self,
@@ -1570,7 +2273,7 @@ def is_ready(
     backend: str,
     mi: ModelInstance,
     health_check_path: Optional[str] = None,
-    model: Model = None,
+    model: Optional[Model] = None,
 ) -> bool:
     """
     Access the health endpoint of the given model instance to check if it is servable.

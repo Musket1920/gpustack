@@ -2,6 +2,8 @@ import importlib.util
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 from gpustack.config.config import Config
 from gpustack.schemas.models import BackendEnum, ModelInstanceStateEnum
 from tests.worker.fake_backend_fixture import fake_backend_fixture
@@ -339,8 +341,7 @@ def test_process_registry_upsert_requires_complete_metadata(tmp_path: Path):
     """Characterization: upsert with missing fields raises ValueError."""
     registry = DirectProcessRegistry(make_config(tmp_path))
 
-    import pytest as _pytest
-    with _pytest.raises(ValueError, match="requires complete metadata"):
+    with pytest.raises(ValueError, match="requires complete metadata"):
         registry.upsert(
             model_instance_id=1,
             deployment_name="incomplete",
@@ -355,3 +356,70 @@ def test_process_registry_registry_path_is_under_worker_dir(tmp_path: Path):
 
     expected_path = tmp_path / "worker" / "direct_process_registry.json"
     assert registry.path == expected_path
+
+
+def test_process_registry_reused_deployment_name_replaces_prior_mapping(
+    fake_backend_fixture,
+    tmp_path: Path,
+):
+    """Characterization: a deployment name is a singleton mapping to the newest direct process entry."""
+    registry = DirectProcessRegistry(make_config(tmp_path))
+    first_handle = fake_backend_fixture.start_ready_server()
+    second_handle = fake_backend_fixture.start_ready_server()
+
+    registry.upsert(
+        model_instance_id=21,
+        deployment_name="shared-deployment",
+        pid=first_handle.process.pid,
+        process_group_id=get_process_group_id(first_handle.process.pid),
+        port=first_handle.port,
+        log_path=str(tmp_path / "serve" / "21.log"),
+        backend=BackendEnum.VLLM,
+        mode=DIRECT_PROCESS_RUNTIME_MODE,
+    )
+    replacement = registry.upsert(
+        model_instance_id=22,
+        deployment_name="shared-deployment",
+        pid=second_handle.process.pid,
+        process_group_id=get_process_group_id(second_handle.process.pid),
+        port=second_handle.port,
+        log_path=str(tmp_path / "serve" / "22.log"),
+        backend=BackendEnum.VLLM,
+        mode=DIRECT_PROCESS_RUNTIME_MODE,
+    )
+
+    reloaded_registry = DirectProcessRegistry(make_config(tmp_path))
+    entries = reloaded_registry.list_entries()
+
+    assert [entry.model_instance_id for entry in entries] == [22]
+    assert reloaded_registry.get_by_model_instance_id(21) is None
+    assert reloaded_registry.remove_by_model_instance_id(21) is None
+    assert reloaded_registry.get_by_model_instance_id(22) is not None
+    assert reloaded_registry.get_by_deployment_name("shared-deployment") == replacement
+
+
+def test_process_registry_remove_clears_deployment_name_lookup(fake_backend_fixture, tmp_path: Path):
+    """Characterization: removing the active entry clears both model-instance and deployment-name access paths."""
+    registry = DirectProcessRegistry(make_config(tmp_path))
+    handle = fake_backend_fixture.start_ready_server()
+
+    registry.upsert(
+        model_instance_id=23,
+        deployment_name="cleanup-deployment",
+        pid=handle.process.pid,
+        process_group_id=get_process_group_id(handle.process.pid),
+        port=handle.port,
+        log_path=str(tmp_path / "serve" / "23.log"),
+        backend=BackendEnum.VLLM,
+        mode=DIRECT_PROCESS_RUNTIME_MODE,
+    )
+
+    removed = registry.remove_by_model_instance_id(23)
+    reloaded_registry = DirectProcessRegistry(make_config(tmp_path))
+    deployment_status = reloaded_registry.inspect_by_deployment_name("cleanup-deployment")
+
+    assert removed is not None
+    assert removed.model_instance_id == 23
+    assert reloaded_registry.get_by_model_instance_id(23) is None
+    assert reloaded_registry.get_by_deployment_name("cleanup-deployment") is None
+    assert deployment_status.status == DirectProcessEntryStatus.MISSING

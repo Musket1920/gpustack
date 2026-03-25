@@ -1,6 +1,9 @@
 import contextlib
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import importlib
+import json
 import subprocess
 import sys
 import time
@@ -123,7 +126,267 @@ def _apply_model_instance_patch(model_instance: ModelInstance, patch: dict) -> N
         setattr(model_instance, key, value)
 
 
-def _build_manager(serve_manager_module, tmp_path: Path, model_instance: ModelInstance):
+@dataclass(frozen=True)
+class _PreparedEnvironmentIdentityStub:
+    backend: str
+    backend_version: str
+    recipe_id: str | None
+    prepared_environment_id: str | None
+    resolver_version: str
+    python_identity: dict[str, str]
+
+    def manifest_payload(self) -> dict[str, object]:
+        return {
+            "backend": self.backend,
+            "backend_version": self.backend_version,
+            "recipe_id": self.recipe_id,
+            "prepared_environment_id": self.prepared_environment_id,
+            "resolver_version": self.resolver_version,
+            "python_identity": self.python_identity,
+        }
+
+
+class _BootstrapManagerStub:
+    PREPARED_CACHE_CONTEXT_FILENAME = "bootstrap-prepared-context.json"
+    PREPARED_CACHE_RESOLVER_VERSION = "direct-process-bootstrap-v1"
+    BOOTSTRAP_MANIFEST_FILENAME = "bootstrap-manifest.json"
+    BOOTSTRAP_ARTIFACT_FILENAME = "bootstrap-artifact.json"
+    BOOTSTRAP_CONTEXT_FILENAME = "bootstrap-context.txt"
+    BOOTSTRAP_LOCK_FILENAME = "bootstrap.lock"
+    PREPARED_CACHE_ARTIFACTS_DIRNAME = "artifacts"
+    PREPARED_CACHE_PROVISIONING_FILENAME = "bootstrap-provisioning.json"
+    PREPARED_CACHE_ENV_FILENAME = "prepared.env"
+    PREPARED_CACHE_CONFIG_FILENAME = "prepared-config.json"
+    PREPARED_CACHE_LAUNCH_FILENAME = "prepared-launch.sh"
+    PREPARED_CACHE_EXECUTABLE_PROVENANCE_FILENAME = "executable-provenance.json"
+
+    def __init__(self, calls: list[tuple[object, ...]], root: Path):
+        self.calls = calls
+        self._root = root
+
+    def _prepared_cache_path(self, backend_name: str, backend_version: str) -> Path:
+        return self._root / "prepared-cache" / backend_name / backend_version
+
+    def prepared_cache_root(self, backend_name: str, backend_version: str):
+        self.calls.append(("prepared_cache_root", backend_name, backend_version))
+        return self._prepared_cache_path(backend_name, backend_version)
+
+    def prepared_cache_context_path(self, backend_name: str, backend_version: str) -> Path:
+        self.calls.append(("prepared_cache_context_path", backend_name, backend_version))
+        return self._prepared_cache_path(backend_name, backend_version).joinpath(
+            self.PREPARED_CACHE_CONTEXT_FILENAME
+        )
+
+    def prepared_cache_artifacts_root(
+        self,
+        backend_name: str,
+        backend_version: str,
+    ) -> Path:
+        return self._prepared_cache_path(backend_name, backend_version).joinpath(
+            self.PREPARED_CACHE_ARTIFACTS_DIRNAME
+        )
+
+    def prepared_cache_artifact_path(
+        self,
+        backend_name: str,
+        backend_version: str,
+        *parts: str,
+    ) -> Path:
+        path = self.prepared_cache_artifacts_root(backend_name, backend_version).joinpath(
+            *parts
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def prepared_environment_identity(
+        self,
+        *,
+        backend_name: str,
+        backend_version: str,
+        recipe_id: str | None,
+        prepared_environment_id: str | None,
+    ):
+        self.calls.append(
+            (
+                "prepared_environment_identity",
+                backend_name,
+                backend_version,
+                recipe_id,
+                prepared_environment_id,
+            )
+        )
+        return _PreparedEnvironmentIdentityStub(
+            backend=backend_name,
+            backend_version=backend_version,
+            recipe_id=recipe_id,
+            prepared_environment_id=prepared_environment_id,
+            resolver_version=self.PREPARED_CACHE_RESOLVER_VERSION,
+            python_identity={
+                "implementation": "cpython",
+                "version": sys.version.split()[0],
+                "executable": sys.executable,
+                "cache_tag": sys.implementation.cache_tag or "",
+            },
+        )
+
+    def build_prepared_cache_record(
+        self,
+        identity,
+        *,
+        invalidation_state: str = "valid",
+        invalidation_reason: str | None = None,
+    ) -> dict[str, object]:
+        self.calls.append(
+            (
+                "build_prepared_cache_record",
+                identity.backend,
+                identity.backend_version,
+                invalidation_state,
+            )
+        )
+        manifest_payload = identity.manifest_payload()
+        manifest_hash = hashlib.sha256(
+            json.dumps(
+                manifest_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            **manifest_payload,
+            "manifest_hash": manifest_hash,
+            "invalidation": {
+                "state": invalidation_state,
+                "reason": invalidation_reason,
+            },
+        }
+
+    def prepare_prepared_cache_root(self, backend_name: str, backend_version: str):
+        self.calls.append(("prepare_prepared_cache_root", backend_name, backend_version))
+        path = self._prepared_cache_path(backend_name, backend_version)
+        path.mkdir(parents=True, exist_ok=True)
+        artifacts_root = self.prepared_cache_artifacts_root(backend_name, backend_version)
+        artifacts_root.mkdir(parents=True, exist_ok=True)
+        self.prepared_cache_context_path(backend_name, backend_version).write_text(
+            json.dumps(
+                {
+                    "backend": backend_name,
+                    "backend_version": backend_version,
+                    "manifest_hash": "stub-manifest-hash",
+                    "invalidation": {"state": "valid", "reason": None},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.prepared_cache_artifact_path(
+            backend_name,
+            backend_version,
+            self.PREPARED_CACHE_ENV_FILENAME,
+        ).write_text("PATH=/prepared/bin:${PATH}\n", encoding="utf-8")
+        self.prepared_cache_artifact_path(
+            backend_name,
+            backend_version,
+            self.PREPARED_CACHE_LAUNCH_FILENAME,
+        ).write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+        self.prepared_cache_artifact_path(
+            backend_name,
+            backend_version,
+            self.PREPARED_CACHE_CONFIG_FILENAME,
+        ).write_text(
+            json.dumps(
+                {
+                    "backend": backend_name,
+                    "backend_version": backend_version,
+                    "prepared_cache_root": str(path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.prepared_cache_artifact_path(
+            backend_name,
+            backend_version,
+            self.PREPARED_CACHE_EXECUTABLE_PROVENANCE_FILENAME,
+        ).write_text(
+            json.dumps(
+                {
+                    "state": "resolved",
+                    "name": "vllm",
+                    "prepared_path": "/prepared/bin/vllm",
+                    "sha256": "sha256:stub",
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.prepared_cache_artifact_path(
+            backend_name,
+            backend_version,
+            self.PREPARED_CACHE_PROVISIONING_FILENAME,
+        ).write_text(
+            json.dumps({"state": "reused", "backend": backend_name}),
+            encoding="utf-8",
+        )
+        return path
+
+    def prepare_runtime_roots(self, deployment_id: int, model_instance_id: int):
+        self.calls.append(("prepare_runtime_roots", deployment_id, model_instance_id))
+        return SimpleNamespace(
+            workspace=self.workspace_path(deployment_id, model_instance_id),
+            artifacts=self.artifacts_path(deployment_id, model_instance_id),
+            manifests=self.manifests_path(deployment_id, model_instance_id),
+            locks=self.locks_path(deployment_id, model_instance_id),
+        )
+
+    def cleanup_runtime_roots(self, deployment_id: int, model_instance_id: int):
+        self.calls.append(("cleanup_runtime_roots", deployment_id, model_instance_id))
+
+    def workspace_path(self, deployment_id: int, model_instance_id: int, *parts: str) -> Path:
+        base = self._root / "workspace" / str(deployment_id) / str(model_instance_id)
+        if parts:
+            path = base / Path(*parts)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            return path
+        path = base
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def artifacts_path(self, deployment_id: int, model_instance_id: int) -> Path:
+        path = self._root / "artifacts" / str(deployment_id) / str(model_instance_id)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def manifests_path(self, deployment_id: int, model_instance_id: int) -> Path:
+        path = self._root / "manifests" / str(deployment_id) / str(model_instance_id)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def locks_path(self, deployment_id: int, model_instance_id: int) -> Path:
+        path = self._root / "locks" / str(deployment_id) / str(model_instance_id)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def artifact_path(self, deployment_id: int, model_instance_id: int, *parts: str) -> Path:
+        path = self.artifacts_path(deployment_id, model_instance_id) / Path(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def manifest_path(self, deployment_id: int, model_instance_id: int, *parts: str) -> Path:
+        path = self.manifests_path(deployment_id, model_instance_id) / Path(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def lock_path(self, deployment_id: int, model_instance_id: int, *parts: str) -> Path:
+        path = self.locks_path(deployment_id, model_instance_id) / Path(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+
+def _build_manager(
+    serve_manager_module,
+    tmp_path: Path,
+    model_instance: ModelInstance,
+    *,
+    bootstrap_manager=None,
+):
     cfg = make_config(tmp_path)
     model = make_model()
     clientset = _ClientSetStub([model_instance])
@@ -139,6 +402,7 @@ def _build_manager(serve_manager_module, tmp_path: Path, model_instance: ModelIn
     manager._model_instance_by_instance_id = {}
     manager._assigned_ports = {}
     manager._direct_process_registry = serve_manager_module.DirectProcessRegistry(cfg)
+    manager._bootstrap_manager = bootstrap_manager
     manager._inference_backend_manager = SimpleNamespace(
         get_backend_by_name=lambda _backend: SimpleNamespace(health_check_path="/v1/models")
     )
@@ -158,10 +422,17 @@ def _build_manager(serve_manager_module, tmp_path: Path, model_instance: ModelIn
 
 
 class _ProvisioningProcess:
-    def __init__(self, scenario: str, args: tuple, child_pid_path: Path | None = None):
+    def __init__(
+        self,
+        scenario: str,
+        args: tuple,
+        child_pid_path: Path | None = None,
+        lifecycle_events: list[tuple[object, ...]] | None = None,
+    ):
         self._scenario = scenario
         self._args = args
         self._child_pid_path = child_pid_path
+        self._lifecycle_events = lifecycle_events
         self._wrapper: subprocess.Popen[str] | None = None
         self._real_process: subprocess.Popen[str] | None = None
         self._log_handle = None
@@ -170,6 +441,8 @@ class _ProvisioningProcess:
 
     def start(self):
         model_instance, backend, _, log_file_path, _, _, _, _, registry_path = self._args
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append(("process_start", model_instance.id, backend))
         self._wrapper = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(0.2)"],
             stdout=subprocess.DEVNULL,
@@ -245,13 +518,22 @@ class _ProvisioningProcess:
 
 
 class _ProcessFactory:
-    def __init__(self, scenario: str):
+    def __init__(
+        self,
+        scenario: str,
+        lifecycle_events: list[tuple[object, ...]] | None = None,
+    ):
         self._scenario = scenario
+        self._lifecycle_events = lifecycle_events
         self.instances: list[_ProvisioningProcess] = []
 
     def __call__(self, target, args):
         del target
-        process = _ProvisioningProcess(self._scenario, args)
+        process = _ProvisioningProcess(
+            self._scenario,
+            args,
+            lifecycle_events=self._lifecycle_events,
+        )
         self.instances.append(process)
         return process
 
@@ -300,6 +582,130 @@ def test_direct_process_start_ready_stop_tracks_serving_pid(monkeypatch, tmp_pat
         )
         assert manager._direct_process_registry.get_by_model_instance_id(model_instance.id) is None
     finally:
+        for process in process_factory.instances:
+            process.cleanup()
+
+
+def test_direct_process_start_prepares_bootstrap_before_provisioning_launch(
+    monkeypatch, tmp_path: Path
+):
+    model_instance = make_model_instance()
+    bootstrap_calls: list[tuple[object, ...]] = []
+    manager, model, _ = _build_manager(
+        serve_manager_module,
+        tmp_path,
+        model_instance,
+        bootstrap_manager=_BootstrapManagerStub(bootstrap_calls, tmp_path / "bootstrap-stub"),
+    )
+    process_factory = _ProcessFactory("ready", lifecycle_events=bootstrap_calls)
+
+    monkeypatch.setattr(serve_manager_module, "get_meta_from_running_instance", lambda *_args: None)
+    monkeypatch.setattr(serve_manager_module.multiprocessing, "Process", process_factory)
+    monkeypatch.setattr(serve_manager_module.platform, "system", lambda: "linux")
+
+    try:
+        serve_manager_module.ServeManager._start_model_instance(manager, model_instance)
+
+        assert bootstrap_calls[:6] == [
+            ("cleanup_runtime_roots", model_instance.model_id, model_instance.id),
+            (
+                "prepared_environment_identity",
+                str(BackendEnum.VLLM),
+                model.backend_version,
+                "vllm",
+                f"vllm:{model.backend_version}",
+            ),
+            (
+                "build_prepared_cache_record",
+                str(BackendEnum.VLLM),
+                model.backend_version,
+                "valid",
+            ),
+            ("prepared_cache_root", str(BackendEnum.VLLM), model.backend_version),
+            (
+                "prepared_cache_context_path",
+                str(BackendEnum.VLLM),
+                model.backend_version,
+            ),
+            ("prepare_prepared_cache_root", str(BackendEnum.VLLM), model.backend_version),
+        ]
+        assert (
+            bootstrap_calls.index(("prepare_runtime_roots", model_instance.model_id, model_instance.id))
+            < bootstrap_calls.index(("process_start", model_instance.id, BackendEnum.VLLM))
+        )
+        assert _wait_until(lambda: not manager._is_provisioning(model_instance))
+        assert _wait_until(
+            lambda: serve_manager_module.is_ready(
+                BackendEnum.VLLM,
+                model_instance,
+                "/v1/models",
+                model,
+            )
+        )
+
+        serve_manager_module.ServeManager.sync_model_instances_state(manager)
+
+        entry = manager._direct_process_registry.get_by_model_instance_id(model_instance.id)
+        assert entry is not None
+        assert entry.pid == process_factory.instances[0].real_pid
+    finally:
+        serve_manager_module.ServeManager._stop_model_instance(manager, model_instance)
+        for process in process_factory.instances:
+            process.cleanup()
+
+
+def test_direct_process_bootstrap_before_launch_writes_runtime_prepared_artifact_references(
+    monkeypatch,
+    tmp_path: Path,
+):
+    model_instance = make_model_instance()
+    manager, _, _ = _build_manager(serve_manager_module, tmp_path, model_instance)
+    manager._bootstrap_manager = serve_manager_module.BootstrapManager(manager._config)
+    runtime_artifact_path = manager._bootstrap_manager.artifact_path(
+        model_instance.model_id,
+        model_instance.id,
+        manager._bootstrap_manager.BOOTSTRAP_ARTIFACT_FILENAME,
+    )
+    observed: dict[str, object] = {}
+
+    class _ObservingProcessFactory(_ProcessFactory):
+        def __call__(self, target, args):
+            observed["artifact_exists_before_process_object"] = runtime_artifact_path.exists()
+            return super().__call__(target, args)
+
+    process_factory = _ObservingProcessFactory("ready")
+
+    monkeypatch.setattr(serve_manager_module, "get_meta_from_running_instance", lambda *_args: None)
+    monkeypatch.setattr(
+        serve_manager_module,
+        "ensure_model_instance_direct_process_support",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(serve_manager_module.multiprocessing, "Process", process_factory)
+    monkeypatch.setattr(serve_manager_module.platform, "system", lambda: "linux")
+
+    try:
+        serve_manager_module.ServeManager._start_model_instance(manager, model_instance)
+
+        runtime_artifact = json.loads(runtime_artifact_path.read_text(encoding="utf-8"))
+        assert observed["artifact_exists_before_process_object"] is True
+        assert runtime_artifact["prepared_artifacts"]["prepared_cache_context"].endswith(
+            manager._bootstrap_manager.PREPARED_CACHE_CONTEXT_FILENAME
+        )
+        assert runtime_artifact["prepared_artifacts"]["env"].endswith(
+            manager._bootstrap_manager.PREPARED_CACHE_ENV_FILENAME
+        )
+        assert runtime_artifact["prepared_artifacts"]["config"].endswith(
+            manager._bootstrap_manager.PREPARED_CACHE_CONFIG_FILENAME
+        )
+        assert runtime_artifact["prepared_artifacts"]["launch"].endswith(
+            manager._bootstrap_manager.PREPARED_CACHE_LAUNCH_FILENAME
+        )
+        assert runtime_artifact["prepared_artifacts"]["executable_provenance"].endswith(
+            manager._bootstrap_manager.PREPARED_CACHE_EXECUTABLE_PROVENANCE_FILENAME
+        )
+    finally:
+        serve_manager_module.ServeManager._stop_model_instance(manager, model_instance)
         for process in process_factory.instances:
             process.cleanup()
 
@@ -540,7 +946,23 @@ def test_direct_process_stale_registry_cleanup_kills_orphaned_process_group(
     tmp_path: Path,
 ):
     model_instance = make_model_instance(port=18081, ports=[18081])
+    assert model_instance.id is not None
     manager, _, _ = _build_manager(serve_manager_module, tmp_path, model_instance)
+    bootstrap_manager = serve_manager_module.BootstrapManager(manager._config)
+    manager._bootstrap_manager = bootstrap_manager
+    runtime_roots = bootstrap_manager.prepare_runtime_roots(
+        model_instance.model_id,
+        model_instance.id,
+    )
+    sibling_runtime_roots = bootstrap_manager.prepare_runtime_roots(
+        model_instance.model_id,
+        model_instance.id + 1,
+    )
+    (runtime_roots.workspace / "stale.txt").write_text("stale", encoding="utf-8")
+    (sibling_runtime_roots.workspace / "sibling.txt").write_text(
+        "keep",
+        encoding="utf-8",
+    )
     child_pid_path = tmp_path / "stale-child.pid"
     process = subprocess.Popen(
         [
@@ -575,6 +997,14 @@ def test_direct_process_stale_registry_cleanup_kills_orphaned_process_group(
         assert _wait_until(lambda: process.poll() is not None, timeout=5)
         assert _wait_until(lambda: not psutil.pid_exists(child_pid), timeout=5)
         assert manager._direct_process_registry.list_entries() == []
+        assert not runtime_roots.workspace.exists()
+        assert not runtime_roots.artifacts.exists()
+        assert not runtime_roots.manifests.exists()
+        assert not runtime_roots.locks.exists()
+        assert sibling_runtime_roots.workspace.exists()
+        assert sibling_runtime_roots.artifacts.exists()
+        assert sibling_runtime_roots.manifests.exists()
+        assert sibling_runtime_roots.locks.exists()
     finally:
         if process.poll() is None:
             with contextlib.suppress(Exception):
@@ -637,8 +1067,25 @@ def test_direct_process_start_removes_stale_registry_entry_before_launch(
 def test_direct_process_stop_removes_registry_entry(monkeypatch, tmp_path: Path):
     """Characterization: _stop_model_instance removes the registry entry after killing the process."""
     model_instance = make_model_instance()
+    assert model_instance.id is not None
     manager, _, _ = _build_manager(serve_manager_module, tmp_path, model_instance)
+    bootstrap_manager = serve_manager_module.BootstrapManager(manager._config)
+    manager._bootstrap_manager = bootstrap_manager
     process_factory = _ProcessFactory("ready")
+
+    runtime_roots = bootstrap_manager.prepare_runtime_roots(
+        model_instance.model_id,
+        model_instance.id,
+    )
+    sibling_runtime_roots = bootstrap_manager.prepare_runtime_roots(
+        model_instance.model_id,
+        model_instance.id + 1,
+    )
+    (runtime_roots.workspace / "stop.txt").write_text("remove", encoding="utf-8")
+    (sibling_runtime_roots.workspace / "sibling.txt").write_text(
+        "keep",
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr(serve_manager_module, "get_meta_from_running_instance", lambda *_args: None)
     monkeypatch.setattr(serve_manager_module.multiprocessing, "Process", process_factory)
@@ -664,6 +1111,14 @@ def test_direct_process_stop_removes_registry_entry(monkeypatch, tmp_path: Path)
 
         # Registry entry must be gone after stop
         assert manager._direct_process_registry.get_by_model_instance_id(model_instance.id) is None
+        assert not runtime_roots.workspace.exists()
+        assert not runtime_roots.artifacts.exists()
+        assert not runtime_roots.manifests.exists()
+        assert not runtime_roots.locks.exists()
+        assert sibling_runtime_roots.workspace.exists()
+        assert sibling_runtime_roots.artifacts.exists()
+        assert sibling_runtime_roots.manifests.exists()
+        assert sibling_runtime_roots.locks.exists()
     finally:
         for process in process_factory.instances:
             process.cleanup()

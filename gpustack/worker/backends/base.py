@@ -3,12 +3,13 @@ import os
 import sys
 import shlex
 import json
+import re
 import threading
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple, Union
+from typing import Dict, Optional, List, Tuple, Union, cast
 from abc import ABC, abstractmethod
-from transformers import PretrainedConfig
+from transformers.configuration_utils import PretrainedConfig
 
 from gpustack_runner import list_backend_runners
 from gpustack_runner.runner import BackendVersionedRunner
@@ -33,6 +34,7 @@ from gpustack.logging import setup_logging
 from gpustack.schemas.inference_backend import InferenceBackend, ContainerEnvConfig
 from gpustack.schemas.models import (
     BackendEnum,
+    Model,
     ModelInstance,
     ModelInstanceUpdate,
     ModelInstanceStateEnum,
@@ -48,9 +50,14 @@ from gpustack.utils.hub import get_pretrained_config
 from gpustack.utils.profiling import time_decorator
 from gpustack.utils import platform
 from gpustack.utils.runtime import transform_workload_plan
+from gpustack.worker.bootstrap_manager import (
+    BootstrapManager,
+    DirectProcessLaunchArtifacts,
+)
 
 logger = logging.getLogger(__name__)
 lock = threading.Lock()
+_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 class ModelInstanceStateError(Exception):
@@ -129,7 +136,8 @@ class InferenceServer(ABC):
                     "state_message": error_message,
                     "state": ModelInstanceStateEnum.ERROR,
                 }
-                self._update_model_instance(mi.id, **patch_dict)
+                if mi.id is not None:
+                    self._update_model_instance(mi.id, **patch_dict)
             except Exception as ue:
                 logger.error(f"Failed to update model instance: {ue}")
             sys.exit(1)
@@ -153,9 +161,12 @@ class InferenceServer(ABC):
 
     def get_model(self):
         model = self._clientset.models.get(id=self._model_instance.model_id)
-        data_dir = self._config.data_dir
-        for i, param in enumerate(model.backend_parameters or []):
-            model.backend_parameters[i] = param.replace("{data_dir}", data_dir)
+        data_dir = self._config.data_dir or ""
+        if model.backend_parameters:
+            model.backend_parameters = [
+                param.replace("{data_dir}", data_dir) if param else param
+                for param in model.backend_parameters
+            ]
 
         self._model = model
 
@@ -189,7 +200,8 @@ class InferenceServer(ABC):
                 "state_message": error_message,
                 "state": ModelInstanceStateEnum.ERROR,
             }
-            self._update_model_instance(self._model_instance.id, **patch_dict)
+            if self._model_instance.id is not None:
+                self._update_model_instance(self._model_instance.id, **patch_dict)
         except Exception as ue:
             logger.error(f"Failed to update model instance: {ue}")
 
@@ -227,7 +239,7 @@ class InferenceServer(ABC):
 
         auto_config_error: Optional[Exception] = None
         try:
-            pretrained_config = get_pretrained_config(self._model)
+            pretrained_config = get_pretrained_config(cast(Model, self._model))
             if isinstance(pretrained_config, dict):
                 # Ensure we have a PretrainedConfig object, not a dict, for consistency.
                 pretrained_config = PretrainedConfig.from_dict(pretrained_config)
@@ -288,6 +300,8 @@ class InferenceServer(ABC):
         """
         try:
             pretrained_config = self._get_pretrained_config()
+            if pretrained_config is None:
+                return default
             pretrained_or_hf_text_config = get_hf_text_config(pretrained_config)
             return get_max_model_len(pretrained_or_hf_text_config)
         except Exception as e:
@@ -307,7 +321,7 @@ class InferenceServer(ABC):
         try:
             pretrained_config = self._get_pretrained_config()
             if pretrained_config and hasattr(pretrained_config, "architectures"):
-                return pretrained_config.architectures
+                return list(pretrained_config.architectures or [])
         except Exception as e:
             logger.warning(
                 f"Failed to derive model architecture: {e}, continuing with empty list"
@@ -327,7 +341,7 @@ class InferenceServer(ABC):
 
         env = {}
         if not runtime_envs.GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT:
-            env = filter_env_vars(os.environ)
+            env = filter_env_vars(dict(os.environ))
 
         if self._model.env:
             env.update(self._model.env)
@@ -358,19 +372,26 @@ class InferenceServer(ABC):
                 ),
                 None,
             )
-            gpu_indexes = sorted(subworker.gpu_indexes or [])
-            gpu_type = subworker.gpu_type
+            if subworker is not None:
+                gpu_indexes = sorted(subworker.gpu_indexes or [])
+                gpu_type = subworker.gpu_type
+            else:
+                gpu_indexes = []
         else:
             gpu_indexes = sorted(self._model_instance.gpu_indexes or [])
             gpu_type = self._model_instance.gpu_type
 
         gpu_devices: GPUDevicesStatus = []
-        if gpu_indexes and self._worker.status.gpu_devices:
+        worker_status = self._worker.status
+        worker_gpu_devices = (
+            worker_status.gpu_devices if worker_status and worker_status.gpu_devices else []
+        )
+        if gpu_indexes and worker_gpu_devices:
             for index in gpu_indexes:
                 gpu_device = next(
                     (
                         d
-                        for d in self._worker.status.gpu_devices
+                        for d in worker_gpu_devices
                         if d.index == index and (gpu_type is None or d.type == gpu_type)
                     ),
                     None,
@@ -394,8 +415,12 @@ class InferenceServer(ABC):
                 gpu_device.runtime_version,
                 gpu_device.arch_family,
             )
-        elif self._worker.status.gpu_devices:
-            gpu_device = self._worker.status.gpu_devices[0]
+        worker_status = self._worker.status
+        worker_gpu_devices = (
+            worker_status.gpu_devices if worker_status and worker_status.gpu_devices else []
+        )
+        if worker_gpu_devices:
+            gpu_device = worker_gpu_devices[0]
             return (
                 gpu_device.type,
                 gpu_device.runtime_version,
@@ -429,8 +454,11 @@ class InferenceServer(ABC):
                     raise RuntimeError(
                         "All GPUs assigned to the model instance must be of the same type."
                     )
-            key = runtime_envs.GPUSTACK_RUNTIME_DETECT_BACKEND_MAP_RESOURCE_KEY.get(
-                gpu_type
+            resource_key_map = runtime_envs.GPUSTACK_RUNTIME_DETECT_BACKEND_MAP_RESOURCE_KEY
+            key = (
+                resource_key_map.get(gpu_type)
+                if resource_key_map and gpu_type is not None
+                else None
             )
             if key:
                 resources[key] = (
@@ -530,11 +558,14 @@ class InferenceServer(ABC):
         Returns:
             The (main) serving port for the model instance.
         """
-        return (
+        port = (
             self._model_instance.ports[0]
             if self._model_instance.ports
             else self._model_instance.port
         )
+        if port is None:
+            raise RuntimeError("No serving port configured for model instance")
+        return port
 
     @staticmethod
     def _get_serving_command_script(env: dict[str, str]) -> Optional[str]:
@@ -678,13 +709,13 @@ $@
         if target_version:
             self._update_model_backend_service_version(target_version)
         return apply_registry_override_to_image(
-            self._config, image_name, self._fallback_registry
+            self._config, image_name, self._fallback_registry or ""
         )
 
     def _resolve_image(  # noqa: C901
         self,
         backend: Optional[str] = None,
-    ) -> (Optional[str], Optional[str]):
+    ) -> tuple[Optional[str], Optional[str]]:
         """
         Resolve the container image to use for the current backend.
 
@@ -717,18 +748,30 @@ $@
         """
 
         def get_docker_image(bvr: BackendVersionedRunner) -> str:
-            return bvr.variants[0].services[0].versions[0].platforms[0].docker_image
+            variant = next(iter(bvr.variants or []), None)
+            if variant is None:
+                raise RuntimeError("Backend runner variant metadata is missing")
+            service = next(iter(variant.services or []), None)
+            if service is None:
+                raise RuntimeError("Backend runner service metadata is missing")
+            version = next(iter(service.versions or []), None)
+            if version is None:
+                raise RuntimeError("Backend runner version metadata is missing")
+            platform_entry = next(iter(version.platforms or []), None)
+            if platform_entry is None:
+                raise RuntimeError("Backend runner platform metadata is missing")
+            return platform_entry.docker_image
 
         backend, runtime_version, arch_family = self._get_device_info()
         if not backend:
             # Return directly if there is not a valid device.
             # GPUStack-Runner does not provide CPU-only platform images.
             # To use a CPU-only version, user must configure in `Inference Backend` page.
-            return None
+            return None, None
 
         if backend not in available_backends():
             # Return directly if found backend is not within the available backends.
-            return None
+            return None, None
 
         """
         Retrieve runners by queries.
@@ -748,6 +791,8 @@ $@
         """
 
         backend_variant = None
+        if not self._model.backend:
+            return None, None
         service = self._model.backend.lower()
         model_service_version = self._model.backend_version
         service_version = model_service_version
@@ -797,7 +842,9 @@ $@
         ]
         """
 
-        backend_versioned_runners = runners[0].versions
+        backend_versioned_runners = getattr(runners[0], "versions", None)
+        if not backend_versioned_runners:
+            return None, None
 
         # Try to update backend version for server model.
         if backend_versioned_runners and len(backend_versioned_runners) > 0:
@@ -852,9 +899,10 @@ $@
                     self._model.id, ModelUpdate(**self._model.model_dump())
                 )
             if not self._model_instance.backend_version:
-                self._update_model_instance(
-                    self._model_instance.id, backend_version=service_version
-                )
+                if self._model_instance.id is not None:
+                    self._update_model_instance(
+                        self._model_instance.id, backend_version=service_version
+                    )
         except Exception as e:
             logger.error(
                 f"Failed to update model service version {service_version}: {e}"
@@ -899,9 +947,59 @@ $@
     # Shared direct-process runtime contract
     #
     # Backends that support direct-process mode override these methods.
-    # The default implementations return False / raise, so container-mode
-    # backends are completely unaffected.
+    # The default implementations keep bootstrap/prepared-environment
+    # identity explicit while remaining neutral and container-mode safe.
     # ------------------------------------------------------------------
+
+    @classmethod
+    def get_direct_process_bootstrap_recipe_id(cls) -> Optional[str]:
+        """Return the logical bootstrap recipe identifier for this backend.
+
+        The recipe id is shared contract metadata only. It lets follow-up
+        direct-process/bootstrap layers decide whether a backend has a known
+        host-side preparation recipe without coupling that decision to process
+        lifecycle management in the backend base class.
+
+        Returns:
+            A stable backend recipe identifier, or ``None`` when the backend
+            does not currently declare a direct-process bootstrap recipe.
+        """
+        return None
+
+    def get_direct_process_prepared_environment_identity(self) -> Optional[str]:
+        """Return the prepared-environment cache identity for this instance.
+
+        Prepared environments are keyed separately from runtime workspaces.
+        The default identity is purely declarative and stable across workers:
+        ``<backend>:<backend_version>`` when direct-process is supported and a
+        recipe is declared, otherwise ``None``.
+        """
+        backend_version = self._get_direct_process_backend_version()
+        return type(self).build_direct_process_prepared_environment_identity(
+            backend_version
+        )
+
+    def _get_direct_process_backend_version(self) -> str:
+        return (
+            getattr(self._model_instance, "backend_version", None)
+            or getattr(self._model, "backend_version", None)
+            or "unknown"
+        )
+
+    @classmethod
+    def build_direct_process_prepared_environment_identity(
+        cls,
+        backend_version: Optional[str],
+    ) -> Optional[str]:
+        """Build the canonical prepared-environment identity for a version."""
+        if not cls.supports_direct_process():
+            return None
+
+        recipe_id = cls.get_direct_process_bootstrap_recipe_id()
+        if not recipe_id:
+            return None
+
+        return f"{recipe_id}:{backend_version or 'unknown'}"
 
     @classmethod
     def supports_direct_process(cls) -> bool:
@@ -915,12 +1013,38 @@ $@
         return False
 
     @classmethod
+    def supports_single_worker_direct_process(cls) -> bool:
+        """Whether this backend supports non-distributed direct-process mode.
+
+        This explicit fact keeps single-worker readiness separate from any
+        distributed capability checks while preserving the legacy
+        ``supports_direct_process`` hook used by current callers.
+        """
+        return cls.supports_direct_process()
+
+    @classmethod
     def supports_distributed_direct_process(cls) -> bool:
         """Whether this backend supports multi-worker distributed direct-process.
 
         Only ``vLLM`` is expected to return ``True`` in Part 2.
         """
         return False
+
+    @classmethod
+    def is_direct_process_ready(
+        cls,
+        distributed: bool = False,
+    ) -> bool:
+        """Return whether this backend advertises readiness for the request.
+
+        This is shared declarative contract metadata only. Runtime validation,
+        bootstrap preparation, and process lifecycle ownership remain outside
+        ``InferenceServer``.
+        """
+        if distributed:
+            return cls.supports_distributed_direct_process()
+
+        return cls.supports_single_worker_direct_process()
 
     def build_direct_process_command(
         self,
@@ -994,6 +1118,103 @@ $@
             f"{type(self).__name__} does not implement start_direct_process"
         )
 
+    def resolve_direct_process_launch_artifacts(
+        self,
+    ) -> DirectProcessLaunchArtifacts:
+        if self._model_instance.model_id is None or self._model_instance.id is None:
+            raise RuntimeError(
+                "Direct-process launch artifacts require model deployment and model instance identities"
+            )
+
+        backend_name = str(self._model.backend)
+        backend_version = self._get_direct_process_backend_version()
+        return BootstrapManager(self._config).resolve_direct_process_launch_artifacts(
+            deployment_id=self._model_instance.model_id,
+            model_instance_id=self._model_instance.id,
+            backend_name=backend_name,
+            backend_version=backend_version,
+            recipe_id=type(self).get_direct_process_bootstrap_recipe_id(),
+            prepared_environment_id=self.get_direct_process_prepared_environment_identity(),
+        )
+
+    @staticmethod
+    def build_direct_process_launch_wrapper_args(
+        prepared_launch_path: Path,
+        command_args: List[str],
+        *,
+        use_prepared_executable: bool,
+    ) -> List[str]:
+        if not command_args:
+            raise RuntimeError("Direct-process command arguments are required")
+
+        wrapped_args = [str(prepared_launch_path)]
+        if use_prepared_executable:
+            wrapped_args.append("__GPUSTACK_PREPARED_EXECUTABLE__")
+            wrapped_args.extend(command_args[1:])
+            return wrapped_args
+
+        wrapped_args.extend(command_args)
+        return wrapped_args
+
+    @staticmethod
+    def require_resolved_direct_process_executable(
+        artifacts: DirectProcessLaunchArtifacts,
+    ) -> None:
+        if artifacts.prepared_provenance.get("state") != "resolved":
+            raise RuntimeError(
+                "Prepared direct-process executable provenance is not resolved; refusing to bypass prepared launch artifacts"
+            )
+
+    def merge_direct_process_prepared_env_artifacts(
+        self,
+        env: Dict[str, str],
+        artifacts: DirectProcessLaunchArtifacts,
+    ) -> Dict[str, str]:
+        merged_env = dict(env)
+        config_env_artifact = artifacts.prepared_config.get("env_artifact")
+        if config_env_artifact != str(artifacts.prepared_env_path):
+            raise RuntimeError(
+                "Prepared direct-process config artifact does not reference the expected env artifact"
+            )
+
+        for raw_line in artifacts.prepared_env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if "=" not in line:
+                raise RuntimeError(
+                    f"Prepared direct-process env artifact contains an invalid line: {raw_line!r}"
+                )
+            key, value = line.split("=", 1)
+            merged_env[key] = self._expand_prepared_env_value(value, merged_env)
+
+        merged_env["GPUSTACK_PREPARED_ENV_ARTIFACT"] = str(artifacts.prepared_env_path)
+        merged_env["GPUSTACK_PREPARED_CONFIG_ARTIFACT"] = str(
+            artifacts.prepared_config_path
+        )
+        merged_env["GPUSTACK_PREPARED_EXECUTABLE_PROVENANCE"] = str(
+            artifacts.prepared_provenance_path
+        )
+        merged_env["GPUSTACK_PREPARED_MANIFEST_HASH"] = artifacts.manifest_hash
+        if artifacts.prepared_environment_id is not None:
+            merged_env["GPUSTACK_PREPARED_ENVIRONMENT_ID"] = (
+                artifacts.prepared_environment_id
+            )
+        prepared_executable = artifacts.prepared_provenance.get("prepared_path")
+        if isinstance(prepared_executable, str) and prepared_executable:
+            merged_env["GPUSTACK_PREPARED_EXECUTABLE"] = prepared_executable
+        return merged_env
+
+    @staticmethod
+    def _expand_prepared_env_value(value: str, env: Dict[str, str]) -> str:
+        def replace(match: re.Match[str]) -> str:
+            key = match.group(1) or match.group(2) or ""
+            return env.get(key, "")
+
+        return _ENV_VAR_PATTERN.sub(replace, value)
+
 
 def _get_service_version_from_versioned_runner(
     backend_versioned_runner: BackendVersionedRunner,
@@ -1008,7 +1229,16 @@ def _get_service_version_from_versioned_runner(
         The service version string, or None if not found.
     """
     try:
-        return backend_versioned_runner.variants[0].services[0].versions[0].version
+        variant = next(iter(backend_versioned_runner.variants or []), None)
+        if variant is None:
+            return None
+        service = next(iter(variant.services or []), None)
+        if service is None:
+            return None
+        version = next(iter(service.versions or []), None)
+        if version is None:
+            return None
+        return version.version
     except Exception as e:
         logger.error(
             f"Failed to get service version from backend versioned runner: {e}"
@@ -1039,12 +1269,20 @@ def is_ascend(devices: GPUDevicesStatus) -> bool:
 def cal_distributed_parallelism_arguments(
     model_instance: ModelInstance,
 ) -> tuple[int, int]:
-    pp = len(model_instance.distributed_servers.subordinate_workers) + 1
+    distributed_servers = model_instance.distributed_servers
+    subordinate_workers = (
+        distributed_servers.subordinate_workers
+        if distributed_servers and distributed_servers.subordinate_workers
+        else []
+    )
+
+    pp = len(subordinate_workers) + 1
     tp = len(model_instance.gpu_indexes) if model_instance.gpu_indexes else 1
     uneven_pp = tp
     uneven = False
-    for subordinate_worker in model_instance.distributed_servers.subordinate_workers:
-        num_gpus = len(subordinate_worker.gpu_indexes)
+    num_gpus = tp
+    for subordinate_worker in subordinate_workers:
+        num_gpus = len(subordinate_worker.gpu_indexes or [])
         uneven_pp += num_gpus
         if num_gpus != tp:
             uneven = True

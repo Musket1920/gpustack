@@ -281,6 +281,52 @@ async def test_direct_process_file_only_never_calls_container(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_direct_process_bootstrap_logs_stay_file_only_without_implying_readiness(
+    monkeypatch, tmp_path
+):
+    log_file = tmp_path / "bootstrap.log"
+    bootstrap_lines = [
+        "Preparing direct-process bootstrap environment before launch.\n",
+        "Prepared direct-process bootstrap environment; executable provenance: resolved; launching inference server (waiting for readiness).\n",
+        "Failed to prepare direct-process bootstrap environment: bootstrap cache missing\n",
+    ]
+    log_file.write_text("".join(bootstrap_lines), encoding="utf-8")
+    readiness_probes: list[str] = []
+    container_calls: list[dict] = []
+
+    def record_container_ready(name: str):
+        readiness_probes.append(name)
+        return True
+
+    def record_logs_workload(**kwargs):
+        container_calls.append(kwargs)
+        return "container should not be read"
+
+    monkeypatch.setattr(route_logs, "is_container_logs_ready", record_container_ready)
+    monkeypatch.setattr(route_logs, "logs_workload", record_logs_workload)
+
+    result = normalize_newlines(
+        [
+            line
+            async for line in route_logs.combined_log_generator(
+                str(log_file),
+                "",
+                LogOptions(follow=False),
+                "test-instance",
+                file_log_exists=True,
+                file_only=True,
+            )
+        ]
+    )
+
+    assert result == bootstrap_lines
+    assert readiness_probes == []
+    assert container_calls == []
+    assert all("healthy" not in line.lower() for line in result)
+    assert all("running" not in line.lower() for line in result)
+
+
+@pytest.mark.asyncio
 async def test_log_generator_file_path_is_canonical_source_for_direct_process(tmp_path):
     """Characterization: log_generator reads from the exact file path provided."""
     log_file = tmp_path / "serve" / "42.log"
