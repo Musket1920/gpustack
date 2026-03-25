@@ -1,4 +1,5 @@
 import importlib
+import json
 import logging
 from pathlib import Path
 import sys
@@ -37,6 +38,73 @@ def _import_vllm_module():
 vllm_module = _import_vllm_module()
 VLLMServer = vllm_module.VLLMServer
 DIRECT_PROCESS_RUNTIME_MODE = vllm_module.DIRECT_PROCESS_RUNTIME_MODE
+
+
+def _install_fake_launch_artifacts(server: VLLMServer, tmp_path: Path):
+    prepared_root = tmp_path / "prepared" / "vllm"
+    artifacts_root = prepared_root / "artifacts"
+    bin_root = prepared_root / "bin"
+    runtime_root = tmp_path / "runtime" / "1"
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+    bin_root.mkdir(parents=True, exist_ok=True)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    prepared_executable = bin_root / "vllm"
+    prepared_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    prepared_launch = artifacts_root / "prepared-launch.sh"
+    prepared_launch.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    prepared_env = artifacts_root / "prepared.env"
+    prepared_env.write_text(
+        "\n".join(
+            [
+                f"VIRTUAL_ENV={prepared_root / 'venv'}",
+                f"PATH={bin_root}${{PATH}}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prepared_provenance = artifacts_root / "executable-provenance.json"
+    prepared_provenance.write_text(
+        json.dumps(
+            {
+                "state": "resolved",
+                "name": "vllm",
+                "prepared_path": str(prepared_executable),
+                "sha256": "sha256:1234",
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared_config = artifacts_root / "prepared-config.json"
+    prepared_config.write_text(
+        json.dumps(
+            {
+                "backend": str(server._model.backend),
+                "backend_version": server._model_instance.backend_version,
+                "prepared_cache_root": str(prepared_root),
+                "venv_root": str(prepared_root / "venv"),
+                "env_artifact": str(prepared_env),
+                "executable_provenance": str(prepared_provenance),
+                "manifest_hash": "manifest-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    launch_artifacts = SimpleNamespace(
+        prepared_launch_path=prepared_launch,
+        prepared_env_path=prepared_env,
+        prepared_config_path=prepared_config,
+        prepared_provenance_path=prepared_provenance,
+        prepared_config=json.loads(prepared_config.read_text(encoding="utf-8")),
+        prepared_provenance=json.loads(prepared_provenance.read_text(encoding="utf-8")),
+        runtime_artifact_path=runtime_root / "bootstrap-artifact.json",
+        manifest_hash="manifest-123",
+        prepared_environment_id=server.get_direct_process_prepared_environment_identity(),
+    )
+    server.resolve_direct_process_launch_artifacts = lambda: launch_artifacts
+    return launch_artifacts
 
 
 class _FakeSocket:
@@ -85,6 +153,7 @@ def _make_server(
     server._model_instance = cast(
         Any,
         SimpleNamespace(
+            backend_version="0.8.1",
             id=1,
             name="test-instance",
             model_name="test-model",
@@ -124,6 +193,7 @@ def _make_server(
             distributed_follower=False,
         ),
     )
+    _install_fake_launch_artifacts(server, tmp_path)
     return server
 
 
@@ -183,6 +253,8 @@ def test_direct_process_host_prerequisites_pass_command_build_no_workload(
 
     start_result = server._start()
 
+    assert type(server).get_direct_process_bootstrap_recipe_id() == "vllm"
+    assert server.get_direct_process_prepared_environment_identity() == "vllm:0.8.1"
     assert observed["versioned_default_args"] == [
         "vllm",
         "serve",
@@ -191,15 +263,17 @@ def test_direct_process_host_prerequisites_pass_command_build_no_workload(
     assert observed["versioned_model_path"] is None
     assert observed["versioned_port"] is None
     assert observed["popen_args"][:3] == [
-        "custom-vllm",
+        str(tmp_path / "prepared" / "vllm" / "artifacts" / "prepared-launch.sh"),
+        "__GPUSTACK_PREPARED_EXECUTABLE__",
         "serve",
-        "/models/test-model",
     ]
     assert "--host" in observed["popen_args"]
     assert "127.0.0.1" in observed["popen_args"]
     assert "--port" in observed["popen_args"]
     assert "8000" in observed["popen_args"]
     assert observed["popen_kwargs"]["env"]["CUSTOM_ENV"] == "enabled"
+    assert Path(observed["popen_kwargs"]["env"]["GPUSTACK_PREPARED_EXECUTABLE"]).name == "vllm"
+    assert str(tmp_path / "prepared" / "vllm" / "bin") in observed["popen_kwargs"]["env"]["PATH"]
     assert observed["popen_kwargs"]["stdin"] is not None
     assert observed["popen_kwargs"]["start_new_session"] in {True, False}
     assert start_result == {
@@ -270,6 +344,26 @@ def test_direct_process_vllm_distributed_returns_runtime_entries(
     assert result["mode"] == DIRECT_PROCESS_RUNTIME_MODE
     assert [entry["runtime_name"] for entry in result["runtime_entries"]] == expected_runtime_names
     assert len(popen_calls) == len(expected_runtime_names)
+
+
+def test_direct_process_prepared_environment_identity_falls_back_to_model_backend_version(
+    tmp_path: Path,
+):
+    server = _make_server(tmp_path)
+    server._model_instance.backend_version = None
+
+    assert type(server).get_direct_process_bootstrap_recipe_id() == "vllm"
+    assert server.get_direct_process_prepared_environment_identity() == "vllm:0.8.0"
+
+
+def test_direct_process_prepared_environment_identity_falls_back_to_unknown_when_versions_missing(
+    tmp_path: Path,
+):
+    server = _make_server(tmp_path)
+    server._model_instance.backend_version = None
+    server._model.backend_version = None
+
+    assert server.get_direct_process_prepared_environment_identity() == "vllm:unknown"
 
 
 def test_direct_process_host_prerequisites_fail_missing_vllm_updates_state_message(
@@ -368,6 +462,76 @@ def test_direct_process_start_result_has_exactly_four_keys(
     assert result["mode"] == DIRECT_PROCESS_RUNTIME_MODE
 
 
+@pytest.mark.parametrize(
+    "deployment_metadata",
+    [
+        SimpleNamespace(
+            name="leader-distributed",
+            distributed=True,
+            distributed_leader=True,
+            distributed_follower=False,
+        ),
+        SimpleNamespace(
+            name="follower-distributed",
+            distributed=True,
+            distributed_leader=False,
+            distributed_follower=True,
+        ),
+    ],
+    ids=["leader", "follower"],
+)
+def test_direct_process_distributed_start_result_keeps_runtime_entry_contract(
+    monkeypatch,
+    tmp_path: Path,
+    deployment_metadata,
+):
+    server = _make_server(tmp_path)
+    server._get_deployment_metadata = lambda: deployment_metadata
+    if deployment_metadata.distributed_follower:
+        server._model_instance.worker_ip = "127.0.0.1"
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+    call_count = 0
+
+    def fake_popen(args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return FakeProcess(7000 + call_count)
+
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.shutil.which",
+        lambda *_args, **_kwargs: "/usr/bin/vllm",
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.socket.socket",
+        lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.vllm.get_process_group_id", lambda pid: pid + 10
+    )
+    monkeypatch.setattr("gpustack.worker.backends.vllm.subprocess.Popen", fake_popen)
+
+    result = server._start()
+
+    assert set(result.keys()) == {
+        "pid",
+        "process_group_id",
+        "port",
+        "mode",
+        "runtime_entries",
+    }
+    assert result["mode"] == DIRECT_PROCESS_RUNTIME_MODE
+    assert result["runtime_entries"]
+    assert all(
+        set(entry.keys())
+        == {"deployment_name", "runtime_name", "pid", "process_group_id", "port", "log_path"}
+        for entry in result["runtime_entries"]
+    )
+
+
 def test_direct_process_port_check_failure_raises_runtime_error(
     monkeypatch, tmp_path: Path
 ):
@@ -461,9 +625,11 @@ def test_direct_process_vllm_command_starts_with_vllm_serve(
 
     server._start()
 
-    assert observed_args[0] == "vllm"
-    assert observed_args[1] == "serve"
-    assert observed_args[2] == "/models/test-model"
+    assert observed_args[0] == str(
+        tmp_path / "prepared" / "vllm" / "artifacts" / "prepared-launch.sh"
+    )
+    assert observed_args[1] == "__GPUSTACK_PREPARED_EXECUTABLE__"
+    assert observed_args[2] == "serve"
 
 
 def test_direct_process_vllm_mode_constant_value_is_locked():

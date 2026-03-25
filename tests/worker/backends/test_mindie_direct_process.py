@@ -34,6 +34,73 @@ AscendMindIEServer = mindie_module.AscendMindIEServer
 DIRECT_PROCESS_RUNTIME_MODE = mindie_module.DIRECT_PROCESS_RUNTIME_MODE
 
 
+def _install_fake_launch_artifacts(server: AscendMindIEServer, tmp_path: Path):
+    prepared_root = tmp_path / "prepared" / "mindie"
+    artifacts_root = prepared_root / "artifacts"
+    bin_root = prepared_root / "bin"
+    runtime_root = tmp_path / "runtime" / "1"
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+    bin_root.mkdir(parents=True, exist_ok=True)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    prepared_daemon = bin_root / "mindieservice_daemon"
+    prepared_daemon.write_text("#!/bin/sh\n", encoding="utf-8")
+    prepared_launch = artifacts_root / "prepared-launch.sh"
+    prepared_launch.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    prepared_env = artifacts_root / "prepared.env"
+    prepared_env.write_text(
+        "\n".join(
+            [
+                f"VIRTUAL_ENV={prepared_root / 'venv'}",
+                f"PATH={bin_root}${{PATH}}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prepared_provenance = artifacts_root / "executable-provenance.json"
+    prepared_provenance.write_text(
+        json.dumps(
+            {
+                "state": "resolved",
+                "name": "mindieservice_daemon",
+                "prepared_path": str(prepared_daemon),
+                "sha256": "sha256:1234",
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared_config = artifacts_root / "prepared-config.json"
+    prepared_config.write_text(
+        json.dumps(
+            {
+                "backend": str(server._model.backend),
+                "backend_version": server.get_direct_process_prepared_environment_identity().split(":", 1)[1],
+                "prepared_cache_root": str(prepared_root),
+                "venv_root": str(prepared_root / "venv"),
+                "env_artifact": str(prepared_env),
+                "executable_provenance": str(prepared_provenance),
+                "manifest_hash": "manifest-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    launch_artifacts = SimpleNamespace(
+        prepared_launch_path=prepared_launch,
+        prepared_env_path=prepared_env,
+        prepared_config_path=prepared_config,
+        prepared_provenance_path=prepared_provenance,
+        prepared_config=json.loads(prepared_config.read_text(encoding="utf-8")),
+        prepared_provenance=json.loads(prepared_provenance.read_text(encoding="utf-8")),
+        runtime_artifact_path=runtime_root / "bootstrap-artifact.json",
+        manifest_hash="manifest-123",
+        prepared_environment_id=server.get_direct_process_prepared_environment_identity(),
+    )
+    server.resolve_direct_process_launch_artifacts = lambda: launch_artifacts
+    return launch_artifacts
+
+
 class _FakeSocket:
     def bind(self, address):
         self.address = address
@@ -98,9 +165,12 @@ def _make_server(
             id=1,
             name="test-mindie-instance",
             model_name="test-mindie-model",
+            backend_version=None,
             port=9000,
             ports=[9000],
             gpu_indexes=[0],
+            gpu_addresses=["192.168.1.10"],
+            worker_ip="127.0.0.1",
             distributed_servers=None,
         ),
     )
@@ -134,7 +204,24 @@ def _make_server(
     server._get_mindie_install_path = lambda: install_path
     # Store install_path for tests that need it
     server._test_install_path = install_path
+    _install_fake_launch_artifacts(server, tmp_path)
     return server
+
+
+def _set_distributed_topology(server: AscendMindIEServer) -> None:
+    server._model_instance.ports = [9000, 9001]
+    server._model_instance.gpu_indexes = [0, 1]
+    server._model_instance.gpu_addresses = ["192.168.1.10", "192.168.1.11"]
+    server._model_instance.worker_ip = "127.0.0.1"
+    server._model_instance.distributed_servers = SimpleNamespace(
+        subordinate_workers=[
+            SimpleNamespace(
+                worker_ip="127.0.0.2",
+                gpu_indexes=[2, 3],
+                gpu_addresses=["192.168.1.12", "192.168.1.13"],
+            )
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +235,33 @@ def test_mindie_server_supports_direct_process():
 
 
 def test_mindie_server_does_not_support_distributed_direct_process():
-    """AscendMindIEServer does not support distributed direct-process."""
-    assert AscendMindIEServer.supports_distributed_direct_process() is False
+    """AscendMindIEServer declares distributed direct-process support."""
+    assert AscendMindIEServer.supports_distributed_direct_process() is True
+
+
+def test_mindie_server_declares_bootstrap_recipe_id():
+    """AscendMindIEServer advertises the MindIE bootstrap recipe id."""
+    assert AscendMindIEServer.get_direct_process_bootstrap_recipe_id() == "mindie"
+
+
+def test_mindie_server_prepared_environment_identity_uses_backend_version(
+    tmp_path: Path,
+):
+    """Prepared-environment identity stays version-scoped for MindIE."""
+    server = _make_server(tmp_path)
+
+    assert server.get_direct_process_prepared_environment_identity() == "mindie:2.0"
+
+
+def test_mindie_server_prepared_environment_identity_falls_back_to_unknown(
+    tmp_path: Path,
+):
+    """Prepared-environment identity falls back to unknown when no version is set."""
+    server = _make_server(tmp_path)
+    server._model_instance.backend_version = None
+    server._model.backend_version = None
+
+    assert server.get_direct_process_prepared_environment_identity() == "mindie:unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +347,10 @@ def test_direct_process_mindie_launch_happy_path(
         "mode": DIRECT_PROCESS_RUNTIME_MODE,
     }
     # Verify command was built correctly
-    assert "mindieservice_daemon" in observed["popen_args"][0]
+    assert observed["popen_args"][0] == str(
+        tmp_path / "prepared" / "mindie" / "artifacts" / "prepared-launch.sh"
+    )
+    assert observed["popen_args"][1] == "__GPUSTACK_PREPARED_EXECUTABLE__"
     # Verify env includes model env
     assert observed["popen_kwargs"]["env"]["CUSTOM_ENV"] == "enabled"
     # Verify MindIE-specific env vars are set
@@ -248,6 +363,7 @@ def test_direct_process_mindie_launch_happy_path(
     # Verify config JSON was written
     config_path = observed["popen_kwargs"]["env"]["MIES_CONFIG_JSON_PATH"]
     assert Path(config_path).exists()
+    assert str(tmp_path / "runtime" / "1") in config_path
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
     assert "ServerConfig" in config
@@ -289,54 +405,212 @@ def test_direct_process_mindie_result_has_exactly_four_keys(
     assert result["mode"] == DIRECT_PROCESS_RUNTIME_MODE
 
 
+def test_direct_process_mindie_launch_uses_only_primary_port_and_worker_shape(
+    monkeypatch, tmp_path: Path
+):
+    """Characterization: extra ports/GPU indexes do not make MindIE direct-process distributed."""
+    server = _make_server(tmp_path)
+    server._model_instance.ports = [9000, 9001, 9002]
+    server._model_instance.gpu_indexes = [0, 1, 2]
+    server._model_instance.distributed_servers = [
+        SimpleNamespace(worker_id=2, rpc_port=9101),
+        SimpleNamespace(worker_id=3, rpc_port=9102),
+    ]
+    observed: dict[str, Any] = {}
+
+    class FakeProcess:
+        pid = 4321
+
+    def fake_popen(args, **kwargs):
+        observed["args"] = list(args)
+        observed["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "gpustack.worker.backends.ascend_mindie.socket.socket",
+        lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.ascend_mindie.subprocess.Popen", fake_popen
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.ascend_mindie.get_process_group_id", lambda pid: pid
+    )
+
+    result = server.start_direct_process()
+
+    assert result == {
+        "pid": 4321,
+        "process_group_id": 4321,
+        "port": 9000,
+        "mode": DIRECT_PROCESS_RUNTIME_MODE,
+    }
+    assert observed["args"][0] == str(
+        tmp_path / "prepared" / "mindie" / "artifacts" / "prepared-launch.sh"
+    )
+
+    config_path = Path(observed["kwargs"]["env"]["MIES_CONFIG_JSON_PATH"])
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    assert config["ServerConfig"]["port"] == 9000
+    serialized_config = json.dumps(config)
+    assert '"port": 9001' not in serialized_config
+    assert '"port": 9002' not in serialized_config
+
+
 # ---------------------------------------------------------------------------
-# Distributed rejection
+# Distributed launch contract
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("deployment_metadata", "expected_gpu_ids"),
+    [
+        (
+            SimpleNamespace(
+                name="leader-distributed",
+                distributed=True,
+                distributed_leader=True,
+                distributed_follower=False,
+                distributed_follower_index=None,
+            ),
+            [[0, 1]],
+        ),
+        (
+            SimpleNamespace(
+                name="follower-distributed",
+                distributed=True,
+                distributed_leader=False,
+                distributed_follower=True,
+                distributed_follower_index=0,
+            ),
+            [[0, 1]],
+        ),
+    ],
+    ids=["leader", "follower"],
+)
+def test_direct_process_mindie_distributed_launch_returns_single_local_runtime_entry(
+    monkeypatch, tmp_path: Path, deployment_metadata, expected_gpu_ids
+):
+    """Distributed MindIE returns one local serve runtime entry per worker role."""
+    server = _make_server(tmp_path)
+    _set_distributed_topology(server)
+    server._get_deployment_metadata = lambda: deployment_metadata
+    observed: dict[str, Any] = {}
+
+    class FakeProcess:
+        pid = 4567
+
+    def fake_popen(args, **kwargs):
+        observed["args"] = list(args)
+        observed["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "gpustack.worker.backends.ascend_mindie.socket.socket",
+        lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.ascend_mindie.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.ascend_mindie.get_process_group_id", lambda pid: pid + 10
+    )
+
+    result = server._start()
+
+    assert result == {
+        "pid": 4567,
+        "process_group_id": 4577,
+        "port": 9000,
+        "mode": DIRECT_PROCESS_RUNTIME_MODE,
+        "runtime_entries": [
+            {
+                "deployment_name": deployment_metadata.name,
+                "runtime_name": "serve",
+                "pid": 4567,
+                "process_group_id": 4577,
+                "port": 9000,
+                "log_path": server._runtime_log_path("serve"),
+            }
+        ],
+    }
+    assert observed["args"][0] == str(
+        tmp_path / "prepared" / "mindie" / "artifacts" / "prepared-launch.sh"
+    )
+
+    config_path = Path(observed["kwargs"]["env"]["MIES_CONFIG_JSON_PATH"])
+    rank_table_path = Path(observed["kwargs"]["env"]["RANK_TABLE_FILE"])
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    with open(rank_table_path, "r", encoding="utf-8") as f:
+        rank_table = json.load(f)
+
+    assert config["ServerConfig"]["port"] == 9000
+    assert config["BackendConfig"]["multiNodesInferEnabled"] is True
+    assert config["BackendConfig"]["multiNodesInferPort"] == 9001
+    assert config["BackendConfig"]["npuDeviceIds"] == expected_gpu_ids
+    assert observed["kwargs"]["env"]["WORLD_SIZE"] == "4"
+    assert observed["kwargs"]["env"]["RANKTABLEFILE"] == str(rank_table_path)
+    assert observed["kwargs"]["env"]["RANK_TABLE_FILE"] == str(rank_table_path)
+    assert rank_table["server_count"] == "2"
+
+
+def test_direct_process_mindie_distributed_requires_explicit_role(tmp_path: Path):
+    """Distributed MindIE must say whether the local worker is the leader or follower."""
+    server = _make_server(tmp_path)
+    _set_distributed_topology(server)
+    server._get_deployment_metadata = lambda: SimpleNamespace(
+        name="distributed-before-preflight",
+        distributed=True,
+        distributed_leader=False,
+        distributed_follower=False,
+        distributed_follower_index=None,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Direct-process MindIE distributed launches require an explicit leader or follower role",
+    ):
+        server.start_direct_process()
 
 
 @pytest.mark.parametrize(
     "deployment_metadata",
     [
         SimpleNamespace(
-            name="leader-distributed",
+            name="leader-missing-runtime-port",
             distributed=True,
             distributed_leader=True,
             distributed_follower=False,
+            distributed_follower_index=None,
         ),
         SimpleNamespace(
-            name="follower-distributed",
+            name="follower-missing-runtime-port",
             distributed=True,
             distributed_leader=False,
             distributed_follower=True,
-        ),
-        SimpleNamespace(
-            name="distributed-only",
-            distributed=True,
-            distributed_leader=False,
-            distributed_follower=False,
+            distributed_follower_index=0,
         ),
     ],
-    ids=["leader", "follower", "distributed-flag-only"],
+    ids=["leader", "follower"],
 )
-def test_direct_process_mindie_rejects_distributed(
-    monkeypatch, tmp_path: Path, deployment_metadata
+def test_direct_process_mindie_distributed_requires_secondary_runtime_port(
+    tmp_path: Path, deployment_metadata
 ):
-    """Direct-process MindIE rejects all distributed deployment variants."""
+    """Distributed MindIE requires an explicit secondary init/runtime port."""
     server = _make_server(tmp_path)
+    _set_distributed_topology(server)
+    server._model_instance.ports = [9000]
     server._get_deployment_metadata = lambda: deployment_metadata
 
-    monkeypatch.setattr(
-        "gpustack.worker.backends.ascend_mindie.subprocess.Popen",
-        lambda *_args, **_kwargs: pytest.fail(
-            "distributed direct-process MindIE must not spawn a process"
-        ),
-    )
-
     with pytest.raises(
-        ValueError,
-        match="Direct-process MindIE does not support distributed launches",
+        RuntimeError,
+        match="Direct-process MindIE distributed launches require a secondary port for multi-node initialization",
     ):
-        server._start()
+        server.start_direct_process()
 
 
 # ---------------------------------------------------------------------------

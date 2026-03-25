@@ -100,16 +100,18 @@ def build_manager(tmp_path: Path, worker_id: int, model_instance: ModelInstance)
     Path(cfg.log_dir, "serve").mkdir(parents=True, exist_ok=True)
     Path(cfg.data_dir, "worker").mkdir(parents=True, exist_ok=True)
     manager = object.__new__(serve_manager_module.ServeManager)
+    clientset = SimpleNamespace(headers={}, model_instances=SimpleNamespace())
     manager._config = cfg
     manager._serve_log_dir = str(Path(cfg.log_dir) / "serve")
     manager._worker_id_getter = lambda: worker_id
-    manager._clientset_getter = lambda: SimpleNamespace()
+    manager._clientset_getter = lambda: clientset
     manager._provisioning_processes = {}
     manager._error_model_instances = {}
     manager._model_cache_by_instance = {}
     manager._model_instance_by_instance_id = {}
     manager._assigned_ports = {}
     manager._direct_process_registry = serve_manager_module.DirectProcessRegistry(cfg)
+    manager._bootstrap_manager = None
     manager._inference_backend_manager = SimpleNamespace(
         get_backend_by_name=lambda _backend: SimpleNamespace(health_check_path="/v1/models")
     )
@@ -133,6 +135,25 @@ def _write_runtime_entry(registry, *, model_instance_id: int, deployment_name: s
         log_path=log_path,
         backend=BackendEnum.VLLM,
     )
+
+
+def _prepare_bootstrap_runtime_roots(manager, model_instance: ModelInstance):
+    assert model_instance.model_id is not None
+    assert model_instance.id is not None
+    bootstrap_manager = serve_manager_module.BootstrapManager(manager._config)
+    roots = bootstrap_manager.prepare_runtime_roots(model_instance.model_id, model_instance.id)
+    roots.workspace.joinpath("workspace.txt").write_text("workspace", encoding="utf-8")
+    roots.artifacts.joinpath("artifact.txt").write_text("artifact", encoding="utf-8")
+    roots.manifests.joinpath("manifest.txt").write_text("manifest", encoding="utf-8")
+    roots.locks.joinpath("bootstrap.lock").write_text("lock", encoding="utf-8")
+    return roots
+
+
+def _assert_bootstrap_runtime_roots_removed(roots) -> None:
+    assert not roots.workspace.exists()
+    assert not roots.artifacts.exists()
+    assert not roots.manifests.exists()
+    assert not roots.locks.exists()
 
 
 def test_distributed_direct_process_vllm_start_ready_runtime(monkeypatch, tmp_path: Path):
@@ -194,6 +215,47 @@ def test_distributed_direct_process_vllm_start_ready_runtime(monkeypatch, tmp_pa
     assert leader_updates[-1]["pid"] == 101
 
 
+def test_distributed_direct_process_vllm_main_waits_for_subordinates_before_ready(
+    monkeypatch, tmp_path: Path
+):
+    model_instance = make_model_instance()
+    leader_manager, leader_updates = build_manager(tmp_path, 1, model_instance)
+
+    _write_runtime_entry(
+        leader_manager._direct_process_registry,
+        model_instance_id=1,
+        deployment_name="distributed-vllm",
+        runtime_name="serve",
+        pid=101,
+        port=8000,
+        log_path=str(Path(leader_manager._serve_log_dir) / "1.log"),
+    )
+    _write_runtime_entry(
+        leader_manager._direct_process_registry,
+        model_instance_id=1,
+        deployment_name="distributed-vllm-ray-head",
+        runtime_name="ray-head",
+        pid=102,
+        port=8100,
+        log_path=str(Path(leader_manager._serve_log_dir) / "1.ray-head.log"),
+    )
+
+    monkeypatch.setattr(
+        serve_manager_module,
+        "inspect_direct_process_entry",
+        lambda entry: SimpleNamespace(
+            status=serve_manager_module.DirectProcessEntryStatus.LIVE,
+            entry=entry,
+        ),
+    )
+    monkeypatch.setattr(serve_manager_module, "is_ready", lambda *args, **kwargs: True)
+
+    leader_manager._sync_direct_process_model_instance(model_instance)
+
+    assert leader_updates[-1] == {"pid": 101}
+    assert leader_manager._direct_process_registry.list_by_model_instance_id(1)
+
+
 def test_distributed_direct_process_vllm_subordinate_failure_cleanup(monkeypatch, tmp_path: Path):
     model_instance = make_model_instance()
     assert model_instance.distributed_servers is not None
@@ -202,6 +264,8 @@ def test_distributed_direct_process_vllm_subordinate_failure_cleanup(monkeypatch
     model_instance.distributed_servers.subordinate_workers[0].state = ModelInstanceStateEnum.ERROR
     model_instance.distributed_servers.subordinate_workers[0].state_message = "ray worker exited"
     leader_manager, leader_updates = build_manager(tmp_path, 1, model_instance)
+    leader_manager._model_instance_by_instance_id[model_instance.id] = model_instance
+    runtime_roots = _prepare_bootstrap_runtime_roots(leader_manager, model_instance)
 
     _write_runtime_entry(
         leader_manager._direct_process_registry,
@@ -238,7 +302,104 @@ def test_distributed_direct_process_vllm_subordinate_failure_cleanup(monkeypatch
 
     assert sorted(terminated) == ["ray-head", "serve"]
     assert leader_manager._direct_process_registry.list_by_model_instance_id(1) == []
+    _assert_bootstrap_runtime_roots_removed(runtime_roots)
     assert "Distributed serving error in subordinate worker" in leader_updates[-1]["state_message"]
+
+
+def test_distributed_direct_process_vllm_missing_runtime_rolls_back_and_errors(
+    monkeypatch, tmp_path: Path
+):
+    model_instance = make_model_instance()
+    leader_manager, leader_updates = build_manager(tmp_path, 1, model_instance)
+    leader_manager._model_instance_by_instance_id[model_instance.id] = model_instance
+    runtime_roots = _prepare_bootstrap_runtime_roots(leader_manager, model_instance)
+
+    _write_runtime_entry(
+        leader_manager._direct_process_registry,
+        model_instance_id=1,
+        deployment_name="distributed-vllm",
+        runtime_name="serve",
+        pid=101,
+        port=8000,
+        log_path=str(Path(leader_manager._serve_log_dir) / "1.log"),
+    )
+
+    terminated = []
+    monkeypatch.setattr(
+        leader_manager,
+        "_terminate_direct_process_entries",
+        lambda entries: terminated.extend(entry.runtime_name for entry in entries),
+    )
+
+    leader_manager._sync_direct_process_model_instance(model_instance)
+
+    assert terminated == ["serve"]
+    assert leader_manager._direct_process_registry.list_by_model_instance_id(1) == []
+    _assert_bootstrap_runtime_roots_removed(runtime_roots)
+    assert leader_updates[-1] == {
+        "pid": 101,
+        "state": ModelInstanceStateEnum.ERROR,
+        "state_message": "Inference server exited or unhealthy.",
+    }
+
+
+def test_distributed_direct_process_vllm_prepare_failure_rolls_back_runtime_state(
+    monkeypatch, tmp_path: Path
+):
+    model_instance = make_model_instance()
+    leader_manager, leader_updates = build_manager(tmp_path, 1, model_instance)
+    leader_manager._model_instance_by_instance_id[model_instance.id] = model_instance
+    leader_manager._assigned_ports[model_instance.id] = [8000, 8100]
+    leader_manager._model_cache_by_instance[model_instance.id] = {"cache": "warm"}
+    leader_manager._error_model_instances[model_instance.id] = {"count": 1}
+
+    stale_log = str(Path(leader_manager._serve_log_dir) / "1.stale.log")
+    _write_runtime_entry(
+        leader_manager._direct_process_registry,
+        model_instance_id=1,
+        deployment_name="distributed-vllm",
+        runtime_name="serve",
+        pid=101,
+        port=8000,
+        log_path=stale_log,
+    )
+
+    terminated = []
+
+    def fail_prepare(mi, model, backend):
+        _prepare_bootstrap_runtime_roots(leader_manager, mi)
+        raise RuntimeError("bootstrap preparation failed")
+
+    monkeypatch.setattr(
+        serve_manager_module,
+        "ensure_model_instance_direct_process_support",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(leader_manager, "_prepare_direct_process_bootstrap", fail_prepare)
+    monkeypatch.setattr(
+        leader_manager,
+        "_terminate_direct_process_entries",
+        lambda entries: terminated.extend(entry.runtime_name for entry in entries),
+    )
+
+    leader_manager._start_model_instance(model_instance)
+
+    runtime_roots = serve_manager_module.BootstrapManager(
+        leader_manager._config
+    ).runtime_roots(model_instance.model_id, model_instance.id)
+
+    assert terminated == ["serve"]
+    assert leader_manager._direct_process_registry.list_by_model_instance_id(1) == []
+    _assert_bootstrap_runtime_roots_removed(runtime_roots)
+    assert leader_manager._assigned_ports == {}
+    assert leader_manager._model_cache_by_instance == {}
+    assert leader_manager._error_model_instances == {}
+    assert leader_manager._provisioning_processes == {}
+    assert leader_manager._model_instance_by_instance_id == {}
+    assert leader_updates[-1] == {
+        "state": ModelInstanceStateEnum.ERROR,
+        "state_message": "Failed to prepare direct-process bootstrap environment: bootstrap preparation failed",
+    }
 
 
 @pytest.mark.asyncio

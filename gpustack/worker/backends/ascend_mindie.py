@@ -1,3 +1,4 @@
+import importlib.util
 import argparse
 import dataclasses
 import json
@@ -8,7 +9,7 @@ import socket
 import subprocess
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import TYPE_CHECKING, Optional, List, Dict, Any, Tuple
 
 from gpustack_runtime.deployer import (
     Container,
@@ -24,11 +25,36 @@ from gpustack_runtime.envs import to_bool
 
 from gpustack.schemas.models import ModelInstanceDeploymentMetadata
 from gpustack.utils.envs import sanitize_env
-from gpustack.worker.process_registry import (
-    DIRECT_PROCESS_RUNTIME_MODE,
-    get_process_group_id,
-)
-from gpustack.worker.backends.base import InferenceServer, is_ascend_310p
+try:
+    from gpustack.worker.process_registry import (
+        DIRECT_PROCESS_RUNTIME_MODE,
+        get_process_group_id,
+    )
+except ModuleNotFoundError:  # pragma: no cover - direct file-path smoke import on Windows
+    DIRECT_PROCESS_RUNTIME_MODE = "direct_process"
+
+    def get_process_group_id(pid: int) -> Optional[int]:
+        return None
+
+
+if TYPE_CHECKING:
+    from gpustack.worker.backends.base import InferenceServer as InferenceServerBase
+    from gpustack.worker.backends.base import is_ascend_310p
+else:
+    try:
+        from gpustack.worker.backends.base import InferenceServer as InferenceServerBase
+        from gpustack.worker.backends.base import is_ascend_310p
+    except ModuleNotFoundError:  # pragma: no cover - direct file-path smoke import on Windows
+        _base_spec = importlib.util.spec_from_file_location(
+            "gpustack_worker_backends_base_direct",
+            Path(__file__).with_name("base.py"),
+        )
+        if _base_spec is None or _base_spec.loader is None:
+            raise
+        _base_module = importlib.util.module_from_spec(_base_spec)
+        _base_spec.loader.exec_module(_base_module)
+        InferenceServerBase = _base_module.InferenceServer
+        is_ascend_310p = _base_module.is_ascend_310p
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +90,7 @@ class AscendMindIEParameters:
     npu_memory_fraction: float = 0.8
     trust_remote_code: bool = False
     models: Optional[str] = None
-    models_parsed: Optional[any] = None  # store JSON parsed result
+    models_parsed: Optional[object] = None  # store JSON parsed result
     async_scheduler_wait_time: int = 120
     #
     # Schedule config
@@ -86,12 +112,12 @@ class AscendMindIEParameters:
     # Extends or Features
     #
     override_generation_config: Optional[str] = None
-    override_generation_config_parsed: Optional[any] = None  # store JSON parsed result
+    override_generation_config_parsed: Optional[object] = None  # store JSON parsed result
     enforce_eager: bool = False
     no_metrics: bool = False
     dtype: str = "auto"
     rope_scaling: Optional[str] = None
-    rope_scaling_parsed: Optional[any] = None  # store JSON parsed result
+    rope_scaling_parsed: Optional[object] = None  # store JSON parsed result
     rope_theta: Optional[float] = None
     enable_split: bool = False
     policy_type: int = 0
@@ -1035,7 +1061,9 @@ class AscendMindIEParameters:
                 )
 
 
-class AscendMindIEServer(InferenceServer):
+class AscendMindIEServer(InferenceServerBase):  # type: ignore[misc, valid-type]
+    _DIRECT_PROCESS_BOOTSTRAP_RECIPE_ID = "mindie"
+    _DIRECT_PROCESS_RUNTIME_NAME = "serve"
     """
     Containerized Ascend MindIE inference server backend using gpustack-runtime.
 
@@ -1044,8 +1072,7 @@ class AscendMindIEServer(InferenceServer):
 
     When ``direct_process_mode`` is enabled on the worker config, this backend
     can also launch MindIE as a direct host process instead of inside a
-    container.  Only single-worker deployments are supported in direct-process
-    mode; distributed requests are rejected.
+    container while keeping runtime lifecycle authority outside the backend.
     """
 
     # ------------------------------------------------------------------
@@ -1057,8 +1084,16 @@ class AscendMindIEServer(InferenceServer):
         return True
 
     @classmethod
+    def get_direct_process_bootstrap_recipe_id(cls) -> Optional[str]:
+        return cls._DIRECT_PROCESS_BOOTSTRAP_RECIPE_ID
+
+    def get_direct_process_prepared_environment_identity(self) -> Optional[str]:
+        backend_version = self._get_direct_process_backend_version()
+        return f"{self._DIRECT_PROCESS_BOOTSTRAP_RECIPE_ID}:{backend_version}"
+
+    @classmethod
     def supports_distributed_direct_process(cls) -> bool:
-        return False
+        return True
 
     def build_direct_process_command(self, port: int) -> List[str]:
         # MindIE uses mindieservice_daemon from the Ascend install path.
@@ -1103,24 +1138,92 @@ class AscendMindIEServer(InferenceServer):
     def _start_direct_process(
         self,
         deployment_metadata: ModelInstanceDeploymentMetadata,
-    ) -> Dict[str, int | str | None]:
-        if (
-            deployment_metadata.distributed
-            or deployment_metadata.distributed_leader
+    ) -> Dict[str, object]:
+        bootstrap_recipe_id = type(self).get_direct_process_bootstrap_recipe_id()
+        prepared_environment_id = self.get_direct_process_prepared_environment_identity()
+        launch_artifacts = self.resolve_direct_process_launch_artifacts()
+        self.require_resolved_direct_process_executable(launch_artifacts)
+
+        if deployment_metadata.distributed and not (
+            deployment_metadata.distributed_leader
             or deployment_metadata.distributed_follower
         ):
             raise ValueError(
-                "Direct-process MindIE does not support distributed launches."
+                "Direct-process MindIE distributed launches require an explicit leader or follower role."
             )
 
-        port = self._get_serving_port()
+        command_args, env, port, install_path, config_str = (
+            self._build_direct_process_launch_context(
+                deployment_metadata,
+                launch_artifacts,
+            )
+        )
+        wrapped_command_args = self.build_direct_process_launch_wrapper_args(
+            launch_artifacts.prepared_launch_path,
+            command_args,
+            use_prepared_executable=True,
+        )
 
+        self._preflight_direct_process(command_args=command_args, env=env, port=port)
+
+        logger.info(f"Starting MindIE direct process: {deployment_metadata.name}")
+        logger.info(
+            "Using direct-process bootstrap context: "
+            f"recipe={bootstrap_recipe_id}, prepared_environment={prepared_environment_id}"
+        )
+        logger.info(
+                f"With arguments: [{' '.join(wrapped_command_args)}], "
+            f"envs(inconsistent input items mean unchangeable):{os.linesep}"
+            f"{os.linesep.join(f'{k}={v}' for k, v in sorted(sanitize_env(env).items()))}"
+        )
+        logger.info(
+            f"With JSON configuration:{os.linesep}{config_str}"
+        )
+
+        process = subprocess.Popen(
+            wrapped_command_args,
+            env=env,
+            cwd=str(install_path.joinpath("bin")),
+            stdin=subprocess.DEVNULL,
+            start_new_session=os.name != "nt",
+        )
+
+        logger.info(
+            f"Started MindIE direct process: {deployment_metadata.name}, pid: {process.pid}"
+        )
+        result: Dict[str, object] = {
+            "pid": process.pid,
+            "process_group_id": get_process_group_id(process.pid),
+            "port": port,
+            "mode": DIRECT_PROCESS_RUNTIME_MODE,
+        }
+        if deployment_metadata.distributed:
+            result["runtime_entries"] = [
+                {
+                    "deployment_name": deployment_metadata.name,
+                    "runtime_name": self._DIRECT_PROCESS_RUNTIME_NAME,
+                    "pid": process.pid,
+                    "process_group_id": get_process_group_id(process.pid),
+                    "port": port,
+                    "log_path": self._runtime_log_path(
+                        self._DIRECT_PROCESS_RUNTIME_NAME
+                    ),
+                }
+            ]
+        return result
+
+    def _build_direct_process_launch_context(
+        self,
+        deployment_metadata: ModelInstanceDeploymentMetadata,
+        launch_artifacts,
+    ) -> Tuple[List[str], Dict[str, str], int, Path, str]:
+        port = self._get_serving_port()
         install_path = self._get_mindie_install_path()
 
-        # Build env using the same base as container mode
-        env = self._get_configured_env()
-
-        # Build MindIE JSON config (single-worker, non-distributed)
+        env = self.merge_direct_process_prepared_env_artifacts(
+            self._get_configured_env(),
+            launch_artifacts,
+        )
         config = self._get_mindie_config_json()
         server_config = config.get("ServerConfig", {})
         backend_config = config.get("BackendConfig", {})
@@ -1128,7 +1231,6 @@ class AscendMindIEServer(InferenceServer):
         model_config = model_deploy_config.get("ModelConfig", [{}])[0]
         schedule_config = backend_config.get("ScheduleConfig", {})
 
-        # Apply essential env vars (same as _start for single-worker)
         env["MIES_INSTALL_PATH"] = str(install_path)
         env["MIES_SERVICE_MONITOR_MODE"] = env.pop("MIES_SERVICE_MONITOR_MODE", "1")
         env["MIES_RECOMPUTE_THRESHOLD"] = env.pop("MIES_RECOMPUTE_THRESHOLD", "0.5")
@@ -1166,7 +1268,6 @@ class AscendMindIEServer(InferenceServer):
         env["PYTORCH_NPU_ALLOC_CONF"] = env.pop(
             "PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True"
         )
-        # Pop conflict configuration items
         env.pop("NPU_VISIBLE_DEVICES", "")
         env.pop("NPU-VISIBLE-DEVICES", "")
         env.pop("NPU_DEVICE_IDS", "")
@@ -1176,11 +1277,7 @@ class AscendMindIEServer(InferenceServer):
         env.pop("WORLD_SIZE", "")
         env.pop("RANKTABLEFILE", "")
         env.pop("RANK_TABLE_FILE", "")
-        # Single-worker non-distributed: pop container IP/host IP
-        env.pop("MIES_CONTAINER_IP", "")
-        env.pop("HOST_IP", "")
 
-        # Listening config
         server_config["ipAddress"] = self._worker.ip
         server_config.pop("managementIpAddress", None)
         server_config["allowAllZeroIpListening"] = True
@@ -1191,14 +1288,23 @@ class AscendMindIEServer(InferenceServer):
         server_config["httpsEnabled"] = False
         server_config["interCommTLSEnabled"] = False
 
-        # Device config (single-worker)
         backend_config["interNodeTLSEnabled"] = False
-        gpu_indexes = self._model_instance.gpu_indexes or []
-        backend_config["npuDeviceIds"] = [list(range(len(gpu_indexes)))]
-        model_config["worldSize"] = len(gpu_indexes)
-        backend_config["multiNodesInferEnabled"] = False
+        backend_config["multiNodesInferEnabled"] = bool(deployment_metadata.distributed)
 
-        # Model config
+        local_gpu_indexes = self._model_instance.gpu_indexes or []
+        if deployment_metadata.distributed_follower:
+            local_gpu_indexes = self._get_distributed_follower_gpu_indexes(
+                deployment_metadata
+            )
+
+        backend_config["npuDeviceIds"] = [list(range(len(local_gpu_indexes)))]
+        model_config["worldSize"] = len(local_gpu_indexes)
+        if deployment_metadata.distributed:
+            backend_config["multiNodesInferPort"] = self._get_distributed_runtime_port()
+        else:
+            env.pop("MIES_CONTAINER_IP", "")
+            env.pop("HOST_IP", "")
+
         derived_max_seq_len = self._derive_max_model_len(default=8192)
         max_seq_len = derived_max_seq_len if derived_max_seq_len else 8192
         if max_seq_len > 8192:
@@ -1211,48 +1317,149 @@ class AscendMindIEServer(InferenceServer):
         model_config["modelName"] = self._model.name
         model_config["modelWeightPath"] = self._model_path
 
-        # Write config JSON to disk for direct-process
-        config_dir = install_path.joinpath("conf")
+        config_dir = launch_artifacts.runtime_artifact_path.parent.joinpath("mindie")
         config_dir.mkdir(parents=True, exist_ok=True)
-        config_path = str(config_dir.joinpath("config.json"))
+        if deployment_metadata.distributed:
+            rank_table_path, rank_table_str = self._write_direct_process_rank_table(
+                config_dir=config_dir
+            )
+            env["WORLD_SIZE"] = str(
+                len(self._model_instance.gpu_indexes or [])
+                * (
+                    len(
+                        self._model_instance.distributed_servers.subordinate_workers
+                        if self._model_instance.distributed_servers
+                        and self._model_instance.distributed_servers.subordinate_workers
+                        else []
+                    )
+                    + 1
+                )
+            )
+            env["RANKTABLEFILE"] = str(rank_table_path)
+            env["RANK_TABLE_FILE"] = str(rank_table_path)
+            env["MIES_CONTAINER_IP"] = env.pop("MIES_CONTAINER_IP", self._worker.ip)
+            env["HOST_IP"] = env.pop("HOST_IP", self._worker.ip)
+            env["ATB_LLM_HCCL_ENABLE"] = env.pop("ATB_LLM_HCCL_ENABLE", "1")
+            env["ATB_LLM_COMM_BACKEND"] = env.pop("ATB_LLM_COMM_BACKEND", "hccl")
+            env["HCCL_CONNECT_TIMEOUT"] = env.pop("HCCL_CONNECT_TIMEOUT", "7200")
+            env["HCCL_RDMA_PCIE_DIRECT_POST_NOSTRICT"] = env.pop(
+                "HCCL_RDMA_PCIE_DIRECT_POST_NOSTRICT", "TRUE"
+            )
+            if not is_ascend_310p(self._get_selected_gpu_devices()):
+                env["HCCL_EXEC_TIMEOUT"] = env.pop("HCCL_EXEC_TIMEOUT", "0")
+                env["HCCL_OP_EXPANSION_MODE"] = env.pop(
+                    "HCCL_OP_EXPANSION_MODE", "AIV"
+                )
+            logger.info(
+                f"With rank table JSON configuration:{os.linesep}{rank_table_str}"
+            )
+
+        config_path = config_dir.joinpath("config.json")
         config_str = json.dumps(config, indent=4, ensure_ascii=False)
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(config_str)
-        env["MIES_CONFIG_JSON_PATH"] = config_path
+        env["MIES_CONFIG_JSON_PATH"] = str(config_path)
 
         command_args = self.build_versioned_command_args(
             [str(install_path.joinpath("bin", "mindieservice_daemon"))]
         )
+        return command_args, env, port, install_path, config_str
 
-        self._preflight_direct_process(command_args=command_args, env=env, port=port)
+    def _get_distributed_follower_gpu_indexes(
+        self,
+        deployment_metadata: ModelInstanceDeploymentMetadata,
+    ) -> List[int]:
+        dservers = self._model_instance.distributed_servers
+        subworkers = (
+            dservers.subordinate_workers
+            if dservers and dservers.subordinate_workers
+            else []
+        )
+        follower_index = deployment_metadata.distributed_follower_index
+        if follower_index is None or follower_index >= len(subworkers):
+            raise ValueError(
+                "Direct-process MindIE distributed follower launch is missing subordinate worker metadata."
+            )
+        return subworkers[follower_index].gpu_indexes or []
 
-        logger.info(f"Starting MindIE direct process: {deployment_metadata.name}")
-        logger.info(
-            f"With arguments: [{' '.join(command_args)}], "
-            f"envs(inconsistent input items mean unchangeable):{os.linesep}"
-            f"{os.linesep.join(f'{k}={v}' for k, v in sorted(sanitize_env(env).items()))}"
-        )
-        logger.info(
-            f"With JSON configuration:{os.linesep}{config_str}"
-        )
+    def _get_distributed_runtime_port(self) -> int:
+        ports = self._model_instance.ports or []
+        if len(ports) < 2 or ports[1] is None:
+            raise RuntimeError(
+                "Direct-process MindIE distributed launches require a secondary port for multi-node initialization."
+            )
+        return ports[1]
 
-        process = subprocess.Popen(
-            command_args,
-            env=env,
-            cwd=str(install_path.joinpath("bin")),
-            stdin=subprocess.DEVNULL,
-            start_new_session=os.name != "nt",
+    def _write_direct_process_rank_table(
+        self,
+        config_dir: Path,
+    ) -> Tuple[Path, str]:
+        dservers = self._model_instance.distributed_servers
+        subworkers = (
+            dservers.subordinate_workers
+            if dservers and dservers.subordinate_workers
+            else []
         )
+        leader_gpu_indexes = self._model_instance.gpu_indexes or []
+        leader_gpu_addresses = self._model_instance.gpu_addresses or []
+        server_list = [
+            {
+                "server_id": self._model_instance.worker_ip,
+                "container_ip": self._model_instance.worker_ip,
+                "device": [
+                    {
+                        "device_id": str(leader_gpu_indexes[i]),
+                        "device_ip": leader_gpu_addresses[i],
+                        "rank_id": str(i),
+                    }
+                    for i in range(len(leader_gpu_indexes))
+                ],
+            },
+        ]
+        for i, subworker in enumerate(subworkers):
+            subworker_gpu_indexes = subworker.gpu_indexes or []
+            subworker_gpu_addresses = subworker.gpu_addresses or []
+            server_list.append(
+                {
+                    "server_id": subworker.worker_ip,
+                    "container_ip": subworker.worker_ip,
+                    "device": [
+                        {
+                            "device_id": str(subworker_gpu_indexes[j]),
+                            "device_ip": subworker_gpu_addresses[j],
+                            "rank_id": str(
+                                j + len(subworker_gpu_indexes) * (i + 1)
+                            ),
+                        }
+                        for j in range(len(subworker_gpu_indexes))
+                    ],
+                }
+            )
 
-        logger.info(
-            f"Started MindIE direct process: {deployment_metadata.name}, pid: {process.pid}"
-        )
-        return {
-            "pid": process.pid,
-            "process_group_id": get_process_group_id(process.pid),
-            "port": port,
-            "mode": DIRECT_PROCESS_RUNTIME_MODE,
+        rank_table = {
+            "version": "1.0",
+            "server_count": f"{len(subworkers) + 1}",
+            "server_list": server_list,
+            "status": "completed",
         }
+        rank_table_path = config_dir.joinpath("ranktable.json")
+        rank_table_str = json.dumps(rank_table, indent=4, ensure_ascii=False)
+        with open(rank_table_path, "w", encoding="utf-8") as f:
+            f.write(rank_table_str)
+        return rank_table_path, rank_table_str
+
+    def _runtime_log_path(self, runtime_name: str) -> str:
+        log_path = getattr(self, "_direct_process_log_file_path", "") or ""
+        if not log_path:
+            return log_path
+
+        if runtime_name == self._DIRECT_PROCESS_RUNTIME_NAME:
+            return log_path
+
+        path = Path(log_path)
+        suffix = "".join(path.suffixes) or ".log"
+        stem = path.name[: -len(suffix)] if path.name.endswith(suffix) else path.stem
+        return str(path.with_name(f"{stem}.{runtime_name}{suffix}"))
 
     def _preflight_direct_process(
         self,
@@ -1467,12 +1674,13 @@ class AscendMindIEServer(InferenceServer):
 
         # - Device config
         backend_config["interNodeTLSEnabled"] = False
+        model_instance_gpu_indexes = self._model_instance.gpu_indexes or []
         backend_config["npuDeviceIds"] = [
             # Use logic(count) device indexes as NPU device IDs,
             # which is friendly to virtualized environments.
-            list(range(len(self._model_instance.gpu_indexes)))
+            list(range(len(model_instance_gpu_indexes)))
         ]
-        model_config["worldSize"] = len(self._model_instance.gpu_indexes)
+        model_config["worldSize"] = len(model_instance_gpu_indexes)
         backend_config["multiNodesInferEnabled"] = False
         if deployment_metadata.distributed:
             # Add distributed config if in distributed mode.
@@ -1480,20 +1688,26 @@ class AscendMindIEServer(InferenceServer):
             # During distributed setup,
             # we must get more than one port here,
             # so we use ports[1] for distributed initialization.
-            backend_config["multiNodesInferPort"] = self._model_instance.ports[1]
+            backend_config["multiNodesInferPort"] = self._get_distributed_runtime_port()
         if deployment_metadata.distributed_follower:
-            subworker = subworkers[deployment_metadata.distributed_follower_index]
+            follower_index = deployment_metadata.distributed_follower_index
+            if follower_index is None or follower_index >= len(subworkers):
+                raise ValueError(
+                    "MindIE distributed follower launch is missing subordinate worker metadata."
+                )
+            subworker = subworkers[follower_index]
+            subworker_gpu_indexes = subworker.gpu_indexes or []
             # Override device config if is a subordinate worker.
             backend_config["npuDeviceIds"] = [
                 # Use logic(count) device indexes as NPU device IDs,
                 # which is friendly to virtualized environments.
-                list(range(len(subworker.gpu_indexes)))
+                list(range(len(subworker_gpu_indexes)))
             ]
-            model_config["worldSize"] = len(subworker.gpu_indexes)
+            model_config["worldSize"] = len(subworker_gpu_indexes)
 
         # - Model config
         derived_max_seq_len = self._derive_max_model_len(default=8192)
-        max_seq_len = derived_max_seq_len
+        max_seq_len = derived_max_seq_len or 8192
         # -- Mutate default max sequence length (aka. context length),
         #    but allow to change it with below advanced parameters.
         if max_seq_len > 8192:
@@ -1514,7 +1728,7 @@ class AscendMindIEServer(InferenceServer):
         #       https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0009.html,
         #       https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0300.html,
         #       https://www.hiascend.com/document/detail/zh/mindie/20RC1/mindiellm/llmdev/mindie_llm0425.html.
-        local_world_size = len(self._model_instance.gpu_indexes)
+        local_world_size = len(model_instance_gpu_indexes)
         world_size = local_world_size
         if deployment_metadata.distributed:
             world_size = local_world_size * (len(subworkers) + 1)
@@ -1583,6 +1797,8 @@ class AscendMindIEServer(InferenceServer):
                 env["ATB_OPERATION_EXECUTE_ASYNC"] = "0"
                 env["ASCEND_LAUNCH_BLOCKING"] = "1"
             # --- Mutating model config.
+            if not self._model_path:
+                raise RuntimeError("MindIE requires a resolved model path")
             model_config_path = Path(self._model_path).joinpath("config.json")
             with open(
                 model_config_path,
@@ -1668,7 +1884,11 @@ class AscendMindIEServer(InferenceServer):
             # --- Speculative decoding
             if params.enable_memory_decoding:
                 model_deploy_config["speculationGamma"] = params.memory_decoding_length
-                if derived_max_seq_len > max_seq_len == schedule_config["maxIterTimes"]:
+                if (
+                    derived_max_seq_len is not None
+                    and derived_max_seq_len > max_seq_len
+                    and max_seq_len == schedule_config["maxIterTimes"]
+                ):
                     schedule_config["maxIterTimes"] = (
                         max_seq_len + params.memory_decoding_length
                     )
@@ -1738,6 +1958,8 @@ class AscendMindIEServer(InferenceServer):
         #     https://www.hiascend.com/forum/thread-0237183374051498211-1-1.html
         if deployment_metadata.distributed:
             server_count = f"{len(subworkers) + 1}"
+            leader_gpu_indexes = self._model_instance.gpu_indexes or []
+            leader_gpu_addresses = self._model_instance.gpu_addresses or []
             server_list = [
                 {
                     "server_id": self._model_instance.worker_ip,
@@ -1752,15 +1974,17 @@ class AscendMindIEServer(InferenceServer):
                             # Since rank table will in charge of device mapping in distributed mode,
                             # the above logic(count) device indexes will not affect distributed deployment,
                             # see https://www.hiascend.com/document/detail/zh/mindie/21RC2/mindiellm/llmdev/mindie_llm0004.html#ZH-CN_TOPIC_0000002366997374__section7821428101811.
-                            "device_id": str(self._model_instance.gpu_indexes[i]),
-                            "device_ip": self._model_instance.gpu_addresses[i],
+                            "device_id": str(leader_gpu_indexes[i]),
+                            "device_ip": leader_gpu_addresses[i],
                             "rank_id": str(i),
                         }
-                        for i in range(len(self._model_instance.gpu_indexes))
+                        for i in range(len(leader_gpu_indexes))
                     ],
                 },
             ]
             for i, sw in enumerate(subworkers):
+                subworker_gpu_indexes = sw.gpu_indexes or []
+                subworker_gpu_addresses = sw.gpu_addresses or []
                 server_list.append(
                     {
                         "server_id": sw.worker_ip,
@@ -1775,11 +1999,13 @@ class AscendMindIEServer(InferenceServer):
                                 # Since rank table will in charge of device mapping in distributed mode,
                                 # the above logic(count) device indexes will not affect distributed deployment,
                                 # see https://www.hiascend.com/document/detail/zh/mindie/21RC2/mindiellm/llmdev/mindie_llm0004.html#ZH-CN_TOPIC_0000002366997374__section7821428101811.
-                                "device_id": str(sw.gpu_indexes[j]),
-                                "device_ip": sw.gpu_addresses[j],
-                                "rank_id": str(j + len(sw.gpu_indexes) * (i + 1)),
+                                "device_id": str(subworker_gpu_indexes[j]),
+                                "device_ip": subworker_gpu_addresses[j],
+                                "rank_id": str(
+                                    j + len(subworker_gpu_indexes) * (i + 1)
+                                ),
                             }
-                            for j in range(len(sw.gpu_indexes))
+                            for j in range(len(subworker_gpu_indexes))
                         ],
                     }
                 )
@@ -1801,7 +2027,7 @@ class AscendMindIEServer(InferenceServer):
             )
             # - Set environment variables.
             env["WORLD_SIZE"] = str(
-                len(self._model_instance.gpu_indexes) * (len(subworkers) + 1)
+                len(model_instance_gpu_indexes) * (len(subworkers) + 1)
             )
             env["RANKTABLEFILE"] = str(rank_table_path)
             env["RANK_TABLE_FILE"] = str(rank_table_path)

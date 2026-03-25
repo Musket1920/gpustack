@@ -6,7 +6,7 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, cast
 
 from gpustack_runtime.deployer import (
     Container,
@@ -21,6 +21,7 @@ from gpustack_runtime.deployer import (
 )
 from gpustack_runtime.detector import ManufacturerEnum, manufacturer_to_backend
 from gpustack.schemas.models import (
+    Model,
     ModelInstance,
     SpeculativeAlgorithmEnum,
     SpeculativeConfig,
@@ -37,21 +38,52 @@ from gpustack.utils.command import (
 )
 from gpustack.utils.envs import sanitize_env
 from gpustack.utils.unit import byte_to_gib
-from gpustack.worker.process_registry import (
-    DIRECT_PROCESS_RUNTIME_MODE,
-    get_process_group_id,
-)
-from gpustack.worker.backends.base import (
-    InferenceServer,
-    is_ascend_310p,
-    is_ascend,
-    cal_distributed_parallelism_arguments,
-)
+try:
+    from gpustack.worker.process_registry import (
+        DIRECT_PROCESS_RUNTIME_MODE,
+        get_process_group_id,
+    )
+except ModuleNotFoundError:  # pragma: no cover - direct file-path smoke import on Windows
+    DIRECT_PROCESS_RUNTIME_MODE = "direct_process"
+
+    def get_process_group_id(pid: int) -> Optional[int]:
+        return None
+if TYPE_CHECKING:
+    from gpustack.worker.backends.base import (
+        InferenceServer as InferenceServerBase,
+        is_ascend_310p,
+        is_ascend,
+        cal_distributed_parallelism_arguments,
+    )
+else:
+    try:
+        from gpustack.worker.backends.base import (
+            InferenceServer as InferenceServerBase,
+            is_ascend_310p,
+            is_ascend,
+            cal_distributed_parallelism_arguments,
+        )
+    except ModuleNotFoundError:  # pragma: no cover - direct file-path smoke import on Windows
+        _base_spec = importlib.util.spec_from_file_location(
+            "gpustack_worker_backends_base_direct",
+            Path(__file__).with_name("base.py"),
+        )
+        if _base_spec is None or _base_spec.loader is None:
+            raise
+        _base_module = importlib.util.module_from_spec(_base_spec)
+        _base_spec.loader.exec_module(_base_module)
+        InferenceServerBase = _base_module.InferenceServer
+        is_ascend_310p = _base_module.is_ascend_310p
+        is_ascend = _base_module.is_ascend
+        cal_distributed_parallelism_arguments = (
+            _base_module.cal_distributed_parallelism_arguments
+        )
 
 logger = logging.getLogger(__name__)
 
 
-class VLLMServer(InferenceServer):
+class VLLMServer(InferenceServerBase):
+    _DIRECT_PROCESS_BOOTSTRAP_RECIPE_ID = "vllm"
     _DIRECT_PROCESS_RUNTIME_NAME = "serve"
     _DIRECT_PROCESS_RAY_HEAD_RUNTIME_NAME = "ray-head"
     _DIRECT_PROCESS_RAY_WORKER_RUNTIME_NAME = "ray-worker"
@@ -69,6 +101,14 @@ class VLLMServer(InferenceServer):
     @classmethod
     def supports_direct_process(cls) -> bool:
         return True
+
+    @classmethod
+    def get_direct_process_bootstrap_recipe_id(cls) -> Optional[str]:
+        return cls._DIRECT_PROCESS_BOOTSTRAP_RECIPE_ID
+
+    def get_direct_process_prepared_environment_identity(self) -> Optional[str]:
+        backend_version = self._get_direct_process_backend_version()
+        return f"{self._DIRECT_PROCESS_BOOTSTRAP_RECIPE_ID}:{backend_version}"
 
     @classmethod
     def supports_distributed_direct_process(cls) -> bool:
@@ -98,9 +138,9 @@ class VLLMServer(InferenceServer):
 
     # ------------------------------------------------------------------
 
-    def start(self):  # noqa: C901
+    def start(self) -> None:  # noqa: C901
         try:
-            return self._start()
+            self._start()
         except Exception as e:
             self._handle_error(e)
 
@@ -141,7 +181,12 @@ class VLLMServer(InferenceServer):
     def _start_direct_process(
         self,
         deployment_metadata: ModelInstanceDeploymentMetadata,
-    ) -> Dict[str, int | str | None]:
+    ) -> Dict[str, object]:
+        bootstrap_recipe_id = type(self).get_direct_process_bootstrap_recipe_id()
+        prepared_environment_id = self.get_direct_process_prepared_environment_identity()
+        launch_artifacts = self.resolve_direct_process_launch_artifacts()
+        self.require_resolved_direct_process_executable(launch_artifacts)
+
         if deployment_metadata.distributed and not (
             deployment_metadata.distributed_leader
             or deployment_metadata.distributed_follower
@@ -152,14 +197,30 @@ class VLLMServer(InferenceServer):
 
         if not deployment_metadata.distributed:
             port = self._get_serving_port()
-            env = self._get_configured_env(is_distributed=False)
-            command_args = self._build_command_args(
+            env = self.merge_direct_process_prepared_env_artifacts(
+                self._get_configured_env(is_distributed=False),
+                launch_artifacts,
+            )
+            unwrapped_command_args = self._build_command_args(
                 port=port,
                 is_distributed=False,
             )
-            self._preflight_direct_process(command_args=command_args, env=env, port=port)
+            command_args = self.build_direct_process_launch_wrapper_args(
+                launch_artifacts.prepared_launch_path,
+                unwrapped_command_args,
+                use_prepared_executable=True,
+            )
+            self._preflight_direct_process(
+                command_args=unwrapped_command_args,
+                env=env,
+                port=port,
+            )
 
             logger.info(f"Starting vLLM direct process: {deployment_metadata.name}")
+            logger.info(
+                "Using direct-process bootstrap context: "
+                f"recipe={bootstrap_recipe_id}, prepared_environment={prepared_environment_id}"
+            )
             logger.info(
                 f"With arguments: [{' '.join(command_args)}], "
                 f"envs(inconsistent input items mean unchangeable):{os.linesep}"
@@ -184,17 +245,44 @@ class VLLMServer(InferenceServer):
         self,
         deployment_metadata: ModelInstanceDeploymentMetadata,
     ) -> Dict[str, object]:
-        env = self._get_configured_env(is_distributed=True)
+        launch_artifacts = self.resolve_direct_process_launch_artifacts()
+        self.require_resolved_direct_process_executable(launch_artifacts)
+        env = self.merge_direct_process_prepared_env_artifacts(
+            self._get_configured_env(is_distributed=True),
+            launch_artifacts,
+        )
         port = self._get_serving_port()
         runtime_entries: List[Dict[str, object]] = []
+        logger.info(
+            "Using distributed vLLM direct-process bootstrap context: "
+            f"recipe={type(self).get_direct_process_bootstrap_recipe_id()}, "
+            f"prepared_environment={self.get_direct_process_prepared_environment_identity()}"
+        )
 
         if deployment_metadata.distributed_leader:
-            command_args = self._build_command_args(port=port, is_distributed=True)
-            self._preflight_direct_process(command_args=command_args, env=env, port=port)
+            serve_unwrapped_args = self._build_command_args(
+                port=port,
+                is_distributed=True,
+            )
+            command_args = self.build_direct_process_launch_wrapper_args(
+                launch_artifacts.prepared_launch_path,
+                serve_unwrapped_args,
+                use_prepared_executable=True,
+            )
+            self._preflight_direct_process(
+                command_args=serve_unwrapped_args,
+                env=env,
+                port=port,
+            )
             ray_command, ray_command_args, _ = self._build_ray_configuration(is_leader=True)
+            ray_wrapped_args = self.build_direct_process_launch_wrapper_args(
+                launch_artifacts.prepared_launch_path,
+                ray_command + ray_command_args,
+                use_prepared_executable=False,
+            )
 
             ray_log_path = self._runtime_log_path(self._DIRECT_PROCESS_RAY_HEAD_RUNTIME_NAME)
-            ray_process = self._spawn_direct_process(ray_command + ray_command_args, env, ray_log_path)
+            ray_process = self._spawn_direct_process(ray_wrapped_args, env, ray_log_path)
             serve_process = self._spawn_direct_process(command_args, env)
 
             runtime_entries.extend(
@@ -204,7 +292,7 @@ class VLLMServer(InferenceServer):
                         "runtime_name": self._DIRECT_PROCESS_RAY_HEAD_RUNTIME_NAME,
                         "pid": ray_process.pid,
                         "process_group_id": get_process_group_id(ray_process.pid),
-                        "port": self._model_instance.ports[-1],
+                        "port": self._get_distributed_runtime_port(),
                         "log_path": ray_log_path,
                     },
                     {
@@ -220,14 +308,20 @@ class VLLMServer(InferenceServer):
         elif deployment_metadata.distributed_follower:
             ray_command, ray_command_args, _ = self._build_ray_configuration(is_leader=False)
             ray_log_path = self._runtime_log_path(self._DIRECT_PROCESS_RUNTIME_NAME)
-            ray_process = self._spawn_direct_process(ray_command + ray_command_args, env)
+            self._preflight_direct_process(command_args=ray_command, env=env, port=port)
+            ray_wrapped_args = self.build_direct_process_launch_wrapper_args(
+                launch_artifacts.prepared_launch_path,
+                ray_command + ray_command_args,
+                use_prepared_executable=False,
+            )
+            ray_process = self._spawn_direct_process(ray_wrapped_args, env)
             runtime_entries.append(
                 {
                     "deployment_name": deployment_metadata.name,
                     "runtime_name": self._DIRECT_PROCESS_RAY_WORKER_RUNTIME_NAME,
                     "pid": ray_process.pid,
                     "process_group_id": get_process_group_id(ray_process.pid),
-                    "port": self._model_instance.ports[-1],
+                    "port": self._get_distributed_runtime_port(),
                     "log_path": ray_log_path,
                 }
             )
@@ -433,6 +527,9 @@ class VLLMServer(InferenceServer):
             ray_command, ray_command_args, ray_ports = self._build_ray_configuration(
                 is_leader=False,
             )
+            if run_container.execution is None:
+                raise RuntimeError("vLLM container execution configuration is missing")
+            execution = cast(ContainerExecution, run_container.execution)
 
             # Command script will override the given command,
             # so we need to prepend command to command args.
@@ -440,14 +537,16 @@ class VLLMServer(InferenceServer):
                 ray_command_args = ray_command + ray_command_args
                 ray_command = None
 
-            run_container.execution.command = ray_command
-            # run_container.execution.command_script = command_script # already set
-            run_container.execution.args = ray_command_args
+            execution.command = ray_command
+            # execution.command_script = command_script # already set
+            execution.args = ray_command_args
             run_container.ports = ray_ports
 
         # Create sidecar container for distributed leader.
         sidecar_container = None
         if deployment_metadata.distributed_leader:
+            if run_container.mounts is None:
+                run_container.mounts = []
             run_container.mounts.append(
                 ContainerMount(
                     path="/tmp",
@@ -464,6 +563,11 @@ class VLLMServer(InferenceServer):
             if command_script:
                 ray_command_args = ray_command + ray_command_args
                 ray_command = None
+
+            if run_container.envs is None:
+                run_container.envs = []
+            if run_container.mounts is None:
+                run_container.mounts = []
 
             sidecar_container = Container(
                 image=image,
@@ -510,7 +614,11 @@ class VLLMServer(InferenceServer):
 
         logger.info(f"Created vLLM container workload: {deployment_metadata.name}")
 
-    def _get_configured_env(self, is_distributed: bool) -> Dict[str, str]:
+    def _get_configured_env(
+        self,
+        is_distributed: bool = False,
+        **kwargs,
+    ) -> Dict[str, str]:
         """
         Get environment variables for vLLM service
         """
@@ -573,7 +681,7 @@ class VLLMServer(InferenceServer):
         # During distributed setup,
         # we must get more than one port here,
         # so we use ports[-1] for distributed initialization.
-        env["VLLM_PORT"] = str(self._model_instance.ports[-1])
+        env["VLLM_PORT"] = str(self._get_distributed_runtime_port())
 
         # Disable Ray logging to stderr by default,
         # see https://github.com/gpustack/gpustack/issues/4158#issuecomment-3809213348.
@@ -624,7 +732,7 @@ class VLLMServer(InferenceServer):
         Get speculative arguments for vLLM.
         """
 
-        speculative_config: SpeculativeConfig = self._model.speculative_config
+        speculative_config = self._model.speculative_config
         if not speculative_config or not speculative_config.enabled:
             return []
 
@@ -634,11 +742,12 @@ class VLLMServer(InferenceServer):
             SpeculativeAlgorithmEnum.NGRAM: "ngram",
         }
 
-        method = vllm_speculative_algorithm_mapping.get(
-            speculative_config.algorithm, None
-        )
+        if speculative_config.algorithm is None:
+            return []
+
+        method = vllm_speculative_algorithm_mapping.get(speculative_config.algorithm)
         if method:
-            sp_dict = {
+            sp_dict: dict[str, object] = {
                 "method": method,
             }
             if speculative_config.num_draft_tokens:
@@ -676,6 +785,9 @@ class VLLMServer(InferenceServer):
         if not computed_resource_claim:
             return vram
 
+        if not computed_resource_claim.vram:
+            return vram
+
         for _, vram_claim in computed_resource_claim.vram.items():
             vram += vram_claim
 
@@ -694,16 +806,18 @@ class VLLMServer(InferenceServer):
             "serve",
             self._model_path,
         ]
+        backend_parameters = self._model.backend_parameters or []
+        model = cast(Model, self._model)
 
         # Allow version-specific command override if configured (before appending extra args)
         arguments = self.build_versioned_command_args(arguments)
 
         # Omni modalities
         omni_enabled = find_bool_parameter(
-            self._model.backend_parameters,
+            backend_parameters,
             ["omni"],
         )
-        is_omni = is_omni_model(self._model)
+        is_omni = is_omni_model(model)
         if is_omni and not omni_enabled:
             arguments.extend(
                 [
@@ -711,12 +825,12 @@ class VLLMServer(InferenceServer):
                 ]
             )
 
-        is_audio = is_audio_model(self._model)
+        is_audio = is_audio_model(model)
 
         if not is_omni and not is_audio:
 
             specified_max_model_len = find_parameter(
-                self._model.backend_parameters,
+                backend_parameters,
                 ["max-model-len"],
             )
             if specified_max_model_len is None:
@@ -725,7 +839,7 @@ class VLLMServer(InferenceServer):
                     arguments.extend(["--max-model-len", "8192"])
 
         auto_parallelism_arguments = get_auto_parallelism_arguments(
-            self._model.backend_parameters,
+            backend_parameters,
             self._model_instance,
             is_distributed,
         )
@@ -738,12 +852,12 @@ class VLLMServer(InferenceServer):
         if is_distributed:
             arguments.extend(["--distributed-executor-backend", "ray"])
             dps = find_int_parameter(
-                self._model.backend_parameters, ["data-parallel-size", "dp"]
+                backend_parameters, ["data-parallel-size", "dp"]
             )
             if dps and dps > 1:
                 # Prefer to use Ray backend for data parallelism if DP size is specified.
                 dpb = find_parameter(
-                    self._model.backend_parameters, ["data-parallel-backend", "dpb"]
+                    backend_parameters, ["data-parallel-backend", "dpb"]
                 )
                 if dpb is None:
                     arguments.extend(["--data-parallel-backend", "ray"])
@@ -751,7 +865,7 @@ class VLLMServer(InferenceServer):
                 # we must get more than one port here, see gpustack/worker/serve_manager.py,
                 # so we use ports[1] for DP RPC communication.
                 arguments.extend(
-                    ["--data-parallel-rpc-port", str(self._model_instance.ports[1])]
+                    ["--data-parallel-rpc-port", str(self._get_data_parallel_rpc_port())]
                 )
 
         if self._model.extended_kv_cache and self._model.extended_kv_cache.enabled:
@@ -798,7 +912,7 @@ class VLLMServer(InferenceServer):
     def _build_ray_configuration(
         self,
         is_leader: bool,
-    ) -> (List[str], List[str], Optional[List[ContainerPort]]):
+    ) -> tuple[List[str], List[str], Optional[List[ContainerPort]]]:
         # Parse the Ray port range from configuration,
         # assign ports in order as below:
         # 1.  GCS server port (the first port of the range)
@@ -813,6 +927,9 @@ class VLLMServer(InferenceServer):
         # 10. Raylet runtime env agent port
         # 11. Minimum port number for the worker
         # 12. Maximum port number for the worker (the last port of the range)
+
+        if not self._config.ray_port_range:
+            raise RuntimeError("Ray port range is required for distributed vLLM")
 
         start, end = network.parse_port_range(self._config.ray_port_range)
         gcs_server_port = start
@@ -886,6 +1003,20 @@ class VLLMServer(InferenceServer):
             )
 
         return command, arguments, ports
+
+    def _get_distributed_runtime_port(self) -> int:
+        ports = self._model_instance.ports or []
+        if not ports:
+            raise RuntimeError("Distributed vLLM requires a runtime coordination port")
+        return ports[-1]
+
+    def _get_data_parallel_rpc_port(self) -> int:
+        ports = self._model_instance.ports or []
+        if len(ports) < 2:
+            raise RuntimeError(
+                "Distributed vLLM data parallelism requires a dedicated RPC port"
+            )
+        return ports[1]
 
 
 def get_auto_parallelism_arguments(

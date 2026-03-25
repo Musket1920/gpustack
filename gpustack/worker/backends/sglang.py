@@ -1,10 +1,11 @@
+import importlib.util
 import logging
 import os
 import shutil
 import socket
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from gpustack_runtime.detector import ManufacturerEnum
 from packaging.version import Version
@@ -30,21 +31,53 @@ from gpustack.schemas.models import (
 )
 from gpustack.utils.command import find_parameter, extend_args_no_exist
 from gpustack.utils.envs import sanitize_env
-from gpustack.worker.process_registry import (
-    DIRECT_PROCESS_RUNTIME_MODE,
-    get_process_group_id,
-)
-from gpustack.worker.backends.base import (
-    InferenceServer,
-    cal_distributed_parallelism_arguments,
-    is_ascend,
-    is_ascend_310p,
-)
+try:
+    from gpustack.worker.process_registry import (
+        DIRECT_PROCESS_RUNTIME_MODE,
+        get_process_group_id,
+    )
+except ModuleNotFoundError:  # pragma: no cover - direct file-path smoke import on Windows
+    DIRECT_PROCESS_RUNTIME_MODE = "direct_process"
+
+    def get_process_group_id(pid: int) -> Optional[int]:
+        return None
+
+
+if TYPE_CHECKING:
+    from gpustack.worker.backends.base import (
+        InferenceServer as InferenceServerBase,
+        cal_distributed_parallelism_arguments,
+        is_ascend,
+        is_ascend_310p,
+    )
+else:
+    try:
+        from gpustack.worker.backends.base import (
+            InferenceServer as InferenceServerBase,
+            cal_distributed_parallelism_arguments,
+            is_ascend,
+            is_ascend_310p,
+        )
+    except ModuleNotFoundError:  # pragma: no cover - direct file-path smoke import on Windows
+        _base_spec = importlib.util.spec_from_file_location(
+            "gpustack_worker_backends_base_direct",
+            Path(__file__).with_name("base.py"),
+        )
+        if _base_spec is None or _base_spec.loader is None:
+            raise
+        _base_module = importlib.util.module_from_spec(_base_spec)
+        _base_spec.loader.exec_module(_base_module)
+        InferenceServerBase = _base_module.InferenceServer
+        cal_distributed_parallelism_arguments = (
+            _base_module.cal_distributed_parallelism_arguments
+        )
+        is_ascend = _base_module.is_ascend
+        is_ascend_310p = _base_module.is_ascend_310p
 
 logger = logging.getLogger(__name__)
 
 
-class SGLangServer(InferenceServer):
+class SGLangServer(InferenceServerBase):
     """
     Containerized SGLang inference server backend using gpustack-runtime.
 
@@ -53,11 +86,14 @@ class SGLangServer(InferenceServer):
 
     When ``direct_process_mode`` is enabled on the worker config, this backend
     can also launch SGLang as a direct host process instead of inside a
-    container.  Only single-worker deployments are supported in direct-process
-    mode; distributed requests are rejected.
+    container. Single-worker launches keep their existing behavior, while
+    distributed direct-process launches now return explicit per-worker runtime
+    metadata for leader/follower orchestration on the bootstrap substrate.
     """
 
     is_diffusion = False
+    _DIRECT_PROCESS_BOOTSTRAP_RECIPE_ID = "sglang"
+    _DIRECT_PROCESS_RUNTIME_NAME = "serve"
 
     # ------------------------------------------------------------------
     # Shared direct-process contract implementation
@@ -68,8 +104,16 @@ class SGLangServer(InferenceServer):
         return True
 
     @classmethod
+    def get_direct_process_bootstrap_recipe_id(cls) -> Optional[str]:
+        return cls._DIRECT_PROCESS_BOOTSTRAP_RECIPE_ID
+
+    def get_direct_process_prepared_environment_identity(self) -> Optional[str]:
+        backend_version = self._get_direct_process_backend_version()
+        return f"{self._DIRECT_PROCESS_BOOTSTRAP_RECIPE_ID}:{backend_version}"
+
+    @classmethod
     def supports_distributed_direct_process(cls) -> bool:
-        return False
+        return True
 
     def build_direct_process_command(self, port: int) -> List[str]:
         return self._build_command_args(
@@ -104,48 +148,174 @@ class SGLangServer(InferenceServer):
     def _start_direct_process(
         self,
         deployment_metadata: ModelInstanceDeploymentMetadata,
-    ) -> Dict[str, int | str | None]:
-        if (
-            deployment_metadata.distributed
-            or deployment_metadata.distributed_leader
+    ) -> Dict[str, object]:
+        bootstrap_recipe_id = type(self).get_direct_process_bootstrap_recipe_id()
+        prepared_environment_id = self.get_direct_process_prepared_environment_identity()
+        launch_artifacts = self.resolve_direct_process_launch_artifacts()
+        self.require_resolved_direct_process_executable(launch_artifacts)
+
+        if deployment_metadata.distributed and not (
+            deployment_metadata.distributed_leader
             or deployment_metadata.distributed_follower
         ):
             raise ValueError(
-                "Direct-process SGLang does not support distributed launches."
+                "Direct-process SGLang distributed launches require an explicit leader or follower role."
             )
 
-        port = self._get_serving_port()
-        env = self._get_configured_env(is_distributed=False)
-        command_args = self._build_command_args(
-            port=port,
-            is_distributed=False,
-            is_distributed_leader=False,
-        )
-        self._preflight_direct_process(command_args=command_args, env=env, port=port)
+        if not deployment_metadata.distributed:
+            port = self._get_serving_port()
+            env = self.merge_direct_process_prepared_env_artifacts(
+                self._get_configured_env(is_distributed=False),
+                launch_artifacts,
+            )
+            unwrapped_command_args = self._build_command_args(
+                port=port,
+                is_distributed=False,
+                is_distributed_leader=False,
+            )
+            command_args = self.build_direct_process_launch_wrapper_args(
+                launch_artifacts.prepared_launch_path,
+                unwrapped_command_args,
+                use_prepared_executable=True,
+            )
+            self._preflight_direct_process(
+                command_args=unwrapped_command_args,
+                env=env,
+                port=port,
+            )
 
-        logger.info(f"Starting SGLang direct process: {deployment_metadata.name}")
+            logger.info(f"Starting SGLang direct process: {deployment_metadata.name}")
+            logger.info(
+                "Using direct-process bootstrap context: "
+                f"recipe={bootstrap_recipe_id}, prepared_environment={prepared_environment_id}"
+            )
+            logger.info(
+                f"With arguments: [{' '.join(command_args)}], "
+                f"envs(inconsistent input items mean unchangeable):{os.linesep}"
+                f"{os.linesep.join(f'{k}={v}' for k, v in sorted(sanitize_env(env).items()))}"
+            )
+
+            process = self._spawn_direct_process(command_args, env)
+
+            logger.info(
+                f"Started SGLang direct process: {deployment_metadata.name}, pid: {process.pid}"
+            )
+            return {
+                "pid": process.pid,
+                "process_group_id": get_process_group_id(process.pid),
+                "port": port,
+                "mode": DIRECT_PROCESS_RUNTIME_MODE,
+            }
+
+        return self._start_distributed_direct_process(deployment_metadata)
+
+    def _start_distributed_direct_process(
+        self,
+        deployment_metadata: ModelInstanceDeploymentMetadata,
+    ) -> Dict[str, object]:
+        launch_artifacts = self.resolve_direct_process_launch_artifacts()
+        self.require_resolved_direct_process_executable(launch_artifacts)
+        is_leader = deployment_metadata.distributed_leader
+        if not (is_leader or deployment_metadata.distributed_follower):
+            raise ValueError(
+                "Direct-process SGLang distributed launches require an explicit leader or follower role."
+            )
+
+        env = self.merge_direct_process_prepared_env_artifacts(
+            self._get_configured_env(is_distributed=True),
+            launch_artifacts,
+        )
+        port = self._get_serving_port()
+        unwrapped_command_args = self._build_command_args(
+            port=port,
+            is_distributed=True,
+            is_distributed_leader=is_leader,
+        )
+        command_args = self.build_direct_process_launch_wrapper_args(
+            launch_artifacts.prepared_launch_path,
+            unwrapped_command_args,
+            use_prepared_executable=True,
+        )
+        self._preflight_direct_process(
+            command_args=unwrapped_command_args,
+            env=env,
+            port=port,
+        )
+
+        role = "leader" if is_leader else "follower"
+        logger.info(
+            "Using distributed SGLang direct-process bootstrap context: "
+            f"recipe={type(self).get_direct_process_bootstrap_recipe_id()}, "
+            f"prepared_environment={self.get_direct_process_prepared_environment_identity()}, "
+            f"role={role}"
+        )
+        logger.info(
+            f"Starting distributed SGLang direct process ({role}): {deployment_metadata.name}"
+        )
         logger.info(
             f"With arguments: [{' '.join(command_args)}], "
             f"envs(inconsistent input items mean unchangeable):{os.linesep}"
             f"{os.linesep.join(f'{k}={v}' for k, v in sorted(sanitize_env(env).items()))}"
         )
 
-        process = subprocess.Popen(
+        process = self._spawn_direct_process(
             command_args,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            start_new_session=os.name != "nt",
+            env,
+            self._runtime_log_path(self._DIRECT_PROCESS_RUNTIME_NAME),
         )
-
-        logger.info(
-            f"Started SGLang direct process: {deployment_metadata.name}, pid: {process.pid}"
-        )
-        return {
+        runtime_entry = {
+            "deployment_name": deployment_metadata.name,
+            "runtime_name": self._DIRECT_PROCESS_RUNTIME_NAME,
             "pid": process.pid,
             "process_group_id": get_process_group_id(process.pid),
             "port": port,
-            "mode": DIRECT_PROCESS_RUNTIME_MODE,
+            "log_path": self._runtime_log_path(self._DIRECT_PROCESS_RUNTIME_NAME),
         }
+
+        logger.info(
+            "Started distributed SGLang direct process (%s): %s, pid: %s",
+            role,
+            deployment_metadata.name,
+            process.pid,
+        )
+        return {
+            "pid": runtime_entry["pid"],
+            "process_group_id": runtime_entry["process_group_id"],
+            "port": runtime_entry["port"],
+            "mode": DIRECT_PROCESS_RUNTIME_MODE,
+            "runtime_entries": [runtime_entry],
+        }
+
+    def _runtime_log_path(self, runtime_name: str) -> str:
+        log_path = getattr(self, "_direct_process_log_file_path", "") or ""
+        if not log_path:
+            return log_path
+
+        if runtime_name == self._DIRECT_PROCESS_RUNTIME_NAME:
+            return log_path
+
+        path = Path(log_path)
+        suffix = "".join(path.suffixes) or ".log"
+        stem = path.name[: -len(suffix)] if path.name.endswith(suffix) else path.stem
+        return str(path.with_name(f"{stem}.{runtime_name}{suffix}"))
+
+    def _spawn_direct_process(
+        self,
+        command_args: List[str],
+        env: Dict[str, str],
+        log_path: Optional[str] = None,
+    ):
+        popen_kwargs = {
+            "env": env,
+            "stdin": subprocess.DEVNULL,
+            "start_new_session": os.name != "nt",
+        }
+        if log_path:
+            log_handle = open(log_path, "a", buffering=1, encoding="utf-8")
+            popen_kwargs["stdout"] = log_handle
+            popen_kwargs["stderr"] = log_handle
+
+        return subprocess.Popen(command_args, **popen_kwargs)
 
     def _preflight_direct_process(
         self,
@@ -391,10 +561,11 @@ class SGLangServer(InferenceServer):
 
         logger.info(f"Created SGLang container workload: {deployment_metadata.name}")
 
-    def _get_configured_env(self, is_distributed: bool) -> Dict[str, str]:
+    def _get_configured_env(self, **kwargs) -> Dict[str, str]:
         """
         Get environment variables for SGLang service.
         """
+        is_distributed = bool(kwargs.get("is_distributed", False))
 
         # Apply GPUStack's inference environment setup
         env = super()._get_configured_env()
@@ -480,12 +651,13 @@ class SGLangServer(InferenceServer):
             "--model-path",
             self._model_path,
         ]
+        backend_parameters: List[str] = self._model.backend_parameters or []
 
         # Allow version-specific command override if configured (before appending extra args)
         arguments = self.build_versioned_command_args(arguments)
 
         specified_max_model_len = find_parameter(
-            self._model.backend_parameters,
+            backend_parameters,
             ["context-length"],
         )
         if specified_max_model_len is None:
@@ -495,14 +667,12 @@ class SGLangServer(InferenceServer):
 
         # Add auto parallelism arguments if needed
         auto_parallelism_arguments = get_auto_parallelism_arguments(
-            self._model.backend_parameters, self._model_instance, is_distributed
+            backend_parameters, self._model_instance, is_distributed
         )
         arguments.extend(auto_parallelism_arguments)
 
         # Add metrics arguments if needed
-        metrics_arguments = get_metrics_arguments(
-            self._model.backend_parameters, self._model.env
-        )
+        metrics_arguments = get_metrics_arguments(backend_parameters, self._model.env)
         arguments.extend(metrics_arguments)
 
         # Add multimodal argument if needed
@@ -529,7 +699,7 @@ class SGLangServer(InferenceServer):
             and self._model_instance.computed_resource_claim.vram_utilization
         ):
             input_utilization = find_parameter(
-                self._model.backend_parameters, ["mem-fraction-static"]
+                backend_parameters, ["mem-fraction-static"]
             )
             if not input_utilization:
                 arguments.extend(
@@ -575,13 +745,14 @@ class SGLangServer(InferenceServer):
             "--model-path",
             self._model_path,
         ]
+        backend_parameters: List[str] = self._model.backend_parameters or []
 
         # Allow version-specific command override if configured (before appending extra args)
         arguments = self.build_versioned_command_args(arguments)
 
         # Add auto parallelism arguments if needed
         auto_parallelism_arguments = get_auto_parallelism_arguments(
-            self._model.backend_parameters, self._model_instance, False
+            backend_parameters, self._model_instance, False
         )
         arguments.extend(auto_parallelism_arguments)
 
@@ -599,9 +770,9 @@ class SGLangServer(InferenceServer):
         return arguments
 
     def _get_attention_backend_for_diffusion(self) -> List[str]:
+        backend_parameters: List[str] = self._model.backend_parameters or []
         if (
-            find_parameter(self._model.backend_parameters, ["attention-backend"])
-            is not None
+            find_parameter(backend_parameters, ["attention-backend"]) is not None
         ):
             return []
 
@@ -665,17 +836,15 @@ class SGLangServer(InferenceServer):
         Get multi-node deployment arguments for SGLang.
         """
         arguments = []
+        distributed_servers = getattr(self._model_instance, "distributed_servers", None)
 
         # Check if this is a multi-node deployment
-        if not (
-            self._model_instance.distributed_servers
-            and self._model_instance.distributed_servers.subordinate_workers
-        ):
-            return []
+        if not distributed_servers or not distributed_servers.subordinate_workers:
+            raise RuntimeError(
+                "Distributed SGLang requires subordinate worker metadata"
+            )
 
-        subordinate_workers = (
-            self._model_instance.distributed_servers.subordinate_workers
-        )
+        subordinate_workers = distributed_servers.subordinate_workers
         total_nodes = len(subordinate_workers) + 1  # +1 for the current node
 
         # Find the current node's rank
@@ -697,14 +866,19 @@ class SGLangServer(InferenceServer):
                 "--node-rank",
                 str(node_rank),
                 "--dist-init-addr",
-                # During distributed setup,
-                # we must get more than one port here,
-                # so we use ports[1] for distributed initialization.
-                f"{self._model_instance.worker_ip}:{self._model_instance.ports[1]}",
+                f"{self._model_instance.worker_ip or self._worker.ip}:{self._get_distributed_runtime_port()}",
             ]
         )
 
         return arguments
+
+    def _get_distributed_runtime_port(self) -> int:
+        ports = self._model_instance.ports or []
+        if len(ports) < 2:
+            raise RuntimeError(
+                "Distributed SGLang requires a dedicated initialization port"
+            )
+        return ports[1]
 
     def _get_speculative_arguments(self) -> List[str]:
         """
@@ -714,6 +888,10 @@ class SGLangServer(InferenceServer):
         speculative_config = self._model.speculative_config
         if not speculative_config or not speculative_config.enabled:
             return []
+        algorithm = speculative_config.algorithm
+        if algorithm is None:
+            return []
+        backend_parameters: List[str] = self._model.backend_parameters or []
 
         sglang_speculative_algorithm_mapping = {
             SpeculativeAlgorithmEnum.EAGLE3: "EAGLE3",
@@ -722,9 +900,7 @@ class SGLangServer(InferenceServer):
         }
 
         arguments = []
-        method = sglang_speculative_algorithm_mapping.get(
-            speculative_config.algorithm, None
-        )
+        method = sglang_speculative_algorithm_mapping.get(algorithm)
         if method:
             arguments.extend(
                 [
@@ -766,10 +942,10 @@ class SGLangServer(InferenceServer):
                 )
 
             num_steps = find_parameter(
-                self._model.backend_parameters, ["speculative-num-steps"]
+                backend_parameters, ["speculative-num-steps"]
             )
             topk = find_parameter(
-                self._model.backend_parameters, ["speculative-eagle-topk"]
+                backend_parameters, ["speculative-eagle-topk"]
             )
             if num_steps is None and topk is None:
                 default_steps, default_topk = self._get_default_speculative_steps_topk()
@@ -831,6 +1007,10 @@ def get_auto_parallelism_arguments(
         return []
 
     if is_distributed:
+        if getattr(model_instance, "distributed_servers", None) is None:
+            raise RuntimeError(
+                "Distributed SGLang requires distributed server metadata"
+            )
         # distributed across multiple workers
         (tp, pp) = cal_distributed_parallelism_arguments(model_instance)
         return [

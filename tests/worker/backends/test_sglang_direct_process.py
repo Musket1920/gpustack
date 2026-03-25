@@ -1,4 +1,5 @@
 import importlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -34,6 +35,73 @@ SGLangServer = sglang_module.SGLangServer
 DIRECT_PROCESS_RUNTIME_MODE = sglang_module.DIRECT_PROCESS_RUNTIME_MODE
 
 
+def _install_fake_launch_artifacts(server: SGLangServer, tmp_path: Path):
+    prepared_root = tmp_path / "prepared" / "sglang"
+    artifacts_root = prepared_root / "artifacts"
+    bin_root = prepared_root / "bin"
+    runtime_root = tmp_path / "runtime" / "1"
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+    bin_root.mkdir(parents=True, exist_ok=True)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    prepared_python = bin_root / "python"
+    prepared_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    prepared_launch = artifacts_root / "prepared-launch.sh"
+    prepared_launch.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    prepared_env = artifacts_root / "prepared.env"
+    prepared_env.write_text(
+        "\n".join(
+            [
+                f"VIRTUAL_ENV={prepared_root / 'venv'}",
+                f"PATH={bin_root}${{PATH}}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prepared_provenance = artifacts_root / "executable-provenance.json"
+    prepared_provenance.write_text(
+        json.dumps(
+            {
+                "state": "resolved",
+                "name": "python",
+                "prepared_path": str(prepared_python),
+                "sha256": "sha256:1234",
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared_config = artifacts_root / "prepared-config.json"
+    prepared_config.write_text(
+        json.dumps(
+            {
+                "backend": str(server._model.backend),
+                "backend_version": server._model.backend_version,
+                "prepared_cache_root": str(prepared_root),
+                "venv_root": str(prepared_root / "venv"),
+                "env_artifact": str(prepared_env),
+                "executable_provenance": str(prepared_provenance),
+                "manifest_hash": "manifest-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    launch_artifacts = SimpleNamespace(
+        prepared_launch_path=prepared_launch,
+        prepared_env_path=prepared_env,
+        prepared_config_path=prepared_config,
+        prepared_provenance_path=prepared_provenance,
+        prepared_config=json.loads(prepared_config.read_text(encoding="utf-8")),
+        prepared_provenance=json.loads(prepared_provenance.read_text(encoding="utf-8")),
+        runtime_artifact_path=runtime_root / "bootstrap-artifact.json",
+        manifest_hash="manifest-123",
+        prepared_environment_id=server.get_direct_process_prepared_environment_identity(),
+    )
+    server.resolve_direct_process_launch_artifacts = lambda: launch_artifacts
+    return launch_artifacts
+
+
 class _FakeSocket:
     def bind(self, address):
         self.address = address
@@ -45,6 +113,8 @@ class _FakeSocket:
 def _make_server(
     tmp_path: Path,
     direct_process_mode: bool = True,
+    model_instance_overrides: dict[str, Any] | None = None,
+    deployment_metadata: Any | None = None,
 ) -> SGLangServer:
     data_dir = tmp_path / "data"
     cache_dir = data_dir / "cache"
@@ -76,20 +146,21 @@ def _make_server(
             speculative_config=None,
         ),
     )
-    server._model_instance = cast(
-        Any,
-        SimpleNamespace(
-            id=1,
-            name="test-sglang-instance",
-            model_name="test-sglang-model",
-            port=9000,
-            ports=[9000],
-            gpu_indexes=[0],
-            computed_resource_claim=None,
-        ),
-    )
+    model_instance_data = {
+        "id": 1,
+        "name": "test-sglang-instance",
+        "model_name": "test-sglang-model",
+        "port": 9000,
+        "ports": [9000],
+        "gpu_indexes": [0],
+        "computed_resource_claim": None,
+    }
+    if model_instance_overrides:
+        model_instance_data.update(model_instance_overrides)
+    server._model_instance = cast(Any, SimpleNamespace(**model_instance_data))
     server._model_path = "/models/test-sglang-model"
     server._draft_model_path = None
+    server._direct_process_log_file_path = str(log_dir / "serve" / "1.log")
     server.inference_backend = cast(
         Any,
         SimpleNamespace(
@@ -107,15 +178,15 @@ def _make_server(
     server._get_selected_gpu_devices = lambda: []
     server._get_device_info = lambda: ("nvidia", None, None)
     server._get_model_architecture = lambda: []
-    server._get_deployment_metadata = lambda: cast(
-        Any,
-        SimpleNamespace(
+    if deployment_metadata is None:
+        deployment_metadata = SimpleNamespace(
             name="test-sglang-instance",
             distributed=False,
             distributed_leader=False,
             distributed_follower=False,
-        ),
-    )
+        )
+    server._get_deployment_metadata = lambda: cast(Any, deployment_metadata)
+    _install_fake_launch_artifacts(server, tmp_path)
     return server
 
 
@@ -129,9 +200,17 @@ def test_sglang_server_supports_direct_process():
     assert SGLangServer.supports_direct_process() is True
 
 
-def test_sglang_server_does_not_support_distributed_direct_process():
-    """SGLangServer does not support distributed direct-process."""
-    assert SGLangServer.supports_distributed_direct_process() is False
+def test_sglang_server_supports_distributed_direct_process():
+    """SGLangServer declares distributed direct-process support."""
+    assert SGLangServer.supports_distributed_direct_process() is True
+
+
+def test_sglang_server_direct_process_bootstrap_contract(tmp_path: Path):
+    """SGLang direct-process declares bootstrap recipe and prepared-environment identity."""
+    server = _make_server(tmp_path)
+
+    assert SGLangServer.get_direct_process_bootstrap_recipe_id() == "sglang"
+    assert server.get_direct_process_prepared_environment_identity() == "sglang:0.5.5"
 
 
 # ---------------------------------------------------------------------------
@@ -230,13 +309,18 @@ def test_direct_process_sglang_launch_happy_path(
         "mode": DIRECT_PROCESS_RUNTIME_MODE,
     }
     # Verify command was built correctly
-    assert observed["popen_args"][0] == "python"
+    assert observed["popen_args"][0] == str(
+        tmp_path / "prepared" / "sglang" / "artifacts" / "prepared-launch.sh"
+    )
+    assert observed["popen_args"][1] == "__GPUSTACK_PREPARED_EXECUTABLE__"
     assert "-m" in observed["popen_args"]
     assert "sglang.launch_server" in observed["popen_args"]
     assert "--model-path" in observed["popen_args"]
     assert "/models/test-sglang-model" in observed["popen_args"]
     # Verify env includes model env
     assert observed["popen_kwargs"]["env"]["CUSTOM_ENV"] == "enabled"
+    assert Path(observed["popen_kwargs"]["env"]["GPUSTACK_PREPARED_EXECUTABLE"]).name == "python"
+    assert str(tmp_path / "prepared" / "sglang" / "bin") in observed["popen_kwargs"]["env"]["PATH"]
     assert observed["popen_kwargs"]["stdin"] is not None
     assert observed["popen_kwargs"]["start_new_session"] in {True, False}
 
@@ -280,42 +364,216 @@ def test_direct_process_sglang_result_has_exactly_four_keys(
     assert result["mode"] == DIRECT_PROCESS_RUNTIME_MODE
 
 
+def test_direct_process_sglang_single_worker_launch_uses_only_primary_port(
+    monkeypatch, tmp_path: Path
+):
+    """Characterization: non-distributed SGLang direct-process still launches as a single-port worker even if extra instance ports exist."""
+    server = _make_server(
+        tmp_path,
+        model_instance_overrides={
+            "port": 9000,
+            "ports": [9000, 9001, 9002],
+            "gpu_indexes": [0, 1],
+        },
+    )
+    observed: dict[str, Any] = {}
+
+    class FakeProcess:
+        pid = 4321
+
+    def fake_popen(args, **kwargs):
+        observed["args"] = list(args)
+        observed["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "gpustack.worker.backends.sglang.shutil.which",
+        lambda *_args, **_kwargs: "/usr/bin/python",
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.sglang.socket.socket",
+        lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.sglang.subprocess.Popen", fake_popen
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.sglang.get_process_group_id", lambda pid: pid
+    )
+
+    result = server.start_direct_process()
+
+    port_flag_indexes = [
+        index for index, arg in enumerate(observed["args"]) if arg == "--port"
+    ]
+    assert port_flag_indexes == [observed["args"].index("--port")]
+    assert observed["args"][port_flag_indexes[0] + 1] == "9000"
+    assert "9001" not in observed["args"]
+    assert "9002" not in observed["args"]
+    assert result["port"] == 9000
+
+
 # ---------------------------------------------------------------------------
-# Distributed rejection
+# Distributed contract
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "deployment_metadata",
+    (
+        "deployment_metadata",
+        "current_worker_ip",
+        "subordinate_worker_ips",
+        "expected_node_rank",
+    ),
     [
-        SimpleNamespace(
-            name="leader-distributed",
-            distributed=True,
-            distributed_leader=True,
-            distributed_follower=False,
+        (
+            SimpleNamespace(
+                name="leader-distributed",
+                distributed=True,
+                distributed_leader=True,
+                distributed_follower=False,
+            ),
+            "10.0.0.1",
+            ["10.0.0.2"],
+            "0",
         ),
-        SimpleNamespace(
-            name="follower-distributed",
-            distributed=True,
-            distributed_leader=False,
-            distributed_follower=True,
-        ),
-        SimpleNamespace(
-            name="distributed-only",
-            distributed=True,
-            distributed_leader=False,
-            distributed_follower=False,
+        (
+            SimpleNamespace(
+                name="follower-distributed",
+                distributed=True,
+                distributed_leader=False,
+                distributed_follower=True,
+            ),
+            "10.0.0.2",
+            ["10.0.0.2"],
+            "1",
         ),
     ],
-    ids=["leader", "follower", "distributed-flag-only"],
+    ids=["leader", "follower"],
 )
-def test_direct_process_sglang_rejects_distributed(
-    monkeypatch, tmp_path: Path, deployment_metadata
+def test_direct_process_sglang_distributed_runtime_entry_contract(
+    monkeypatch,
+    tmp_path: Path,
+    deployment_metadata,
+    current_worker_ip,
+    subordinate_worker_ips,
+    expected_node_rank,
 ):
-    """Direct-process SGLang rejects all distributed deployment variants."""
-    server = _make_server(tmp_path)
-    server._get_deployment_metadata = lambda: deployment_metadata
+    """Distributed SGLang direct-process returns a single local serve runtime entry for leader and follower launches."""
+    server = _make_server(
+        tmp_path,
+        model_instance_overrides={
+            "port": 9000,
+            "ports": [9000, 9001],
+            "gpu_indexes": [0, 1],
+            "worker_ip": "10.0.0.1",
+            "distributed_servers": SimpleNamespace(
+                subordinate_workers=[
+                    SimpleNamespace(worker_ip=worker_ip, gpu_indexes=[0, 1])
+                    for worker_ip in subordinate_worker_ips
+                ]
+            ),
+        },
+        deployment_metadata=deployment_metadata,
+    )
+    server._worker = cast(
+        Any, SimpleNamespace(id=1, ip=current_worker_ip, ifname="eth0")
+    )
+    observed: dict[str, Any] = {}
 
+    class FakeProcess:
+        pid = 2468
+
+    def fake_popen(args, **kwargs):
+        observed["args"] = list(args)
+        observed["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "gpustack.worker.backends.sglang.shutil.which",
+        lambda *_args, **_kwargs: "/usr/bin/python",
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.sglang.socket.socket",
+        lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.sglang.subprocess.Popen",
+        fake_popen,
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.sglang.get_process_group_id", lambda pid: pid + 100
+    )
+
+    result = server.start_direct_process()
+
+    assert set(result.keys()) == {
+        "pid",
+        "process_group_id",
+        "port",
+        "mode",
+        "runtime_entries",
+    }
+    assert result["pid"] == 2468
+    assert result["process_group_id"] == 2568
+    assert result["port"] == 9000
+    assert result["mode"] == DIRECT_PROCESS_RUNTIME_MODE
+    assert result["runtime_entries"] == [
+        {
+            "deployment_name": deployment_metadata.name,
+            "runtime_name": "serve",
+            "pid": 2468,
+            "process_group_id": 2568,
+            "port": 9000,
+            "log_path": str(tmp_path / "data" / "log" / "serve" / "1.log"),
+        }
+    ]
+
+    dist_init_addr_index = observed["args"].index("--dist-init-addr")
+    node_rank_index = observed["args"].index("--node-rank")
+    assert observed["args"][dist_init_addr_index + 1] == "10.0.0.1:9001"
+    assert observed["args"][node_rank_index + 1] == expected_node_rank
+    assert observed["kwargs"]["env"]["CUSTOM_ENV"] == "enabled"
+    assert observed["kwargs"]["env"]["OMP_NUM_THREADS"] == "1"
+    assert observed["kwargs"]["env"]["SAFETENSORS_FAST_GPU"] == "1"
+
+
+def test_direct_process_sglang_distributed_requires_explicit_role(
+    monkeypatch, tmp_path: Path
+):
+    """Distributed SGLang without leader/follower role still fails before preflight or process launch."""
+    deployment_metadata = SimpleNamespace(
+        name="distributed-only",
+        distributed=True,
+        distributed_leader=False,
+        distributed_follower=False,
+    )
+    server = _make_server(
+        tmp_path,
+        model_instance_overrides={
+            "ports": [9000, 9001],
+            "gpu_indexes": [0, 1],
+            "distributed_servers": SimpleNamespace(
+                subordinate_workers=[
+                    SimpleNamespace(worker_ip="10.0.0.2", gpu_indexes=[0, 1])
+                ]
+            ),
+        },
+        deployment_metadata=deployment_metadata,
+    )
+
+    monkeypatch.setattr(
+        "gpustack.worker.backends.sglang.shutil.which",
+        lambda *_args, **_kwargs: pytest.fail(
+            "distributed rejection must happen before executable preflight"
+        ),
+    )
+    monkeypatch.setattr(
+        "gpustack.worker.backends.sglang.socket.socket",
+        lambda *_args, **_kwargs: pytest.fail(
+            "distributed rejection must happen before port-bind preflight"
+        ),
+    )
     monkeypatch.setattr(
         "gpustack.worker.backends.sglang.subprocess.Popen",
         lambda *_args, **_kwargs: pytest.fail(
@@ -325,9 +583,9 @@ def test_direct_process_sglang_rejects_distributed(
 
     with pytest.raises(
         ValueError,
-        match="Direct-process SGLang does not support distributed launches",
+        match="Direct-process SGLang distributed launches require an explicit leader or follower role.",
     ):
-        server._start()
+        server.start_direct_process()
 
 
 # ---------------------------------------------------------------------------
