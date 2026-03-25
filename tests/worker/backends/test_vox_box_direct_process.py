@@ -1,6 +1,4 @@
 import importlib
-import logging
-import os
 from pathlib import Path
 import sys
 import types
@@ -40,6 +38,41 @@ class _FakeSocket:
 
     def close(self):
         pass
+
+
+def _make_launch_artifacts(tmp_path: Path, backend_version: str = "0.1.0"):
+    artifacts_dir = tmp_path / "prepared-cache" / "vox-box" / backend_version / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    env_path = artifacts_dir / "prepared.env"
+    env_path.write_text(
+        "export PREPARED_ONLY=from-artifact\n"
+        "export PATH=/prepared/bin:${PATH}\n",
+        encoding="utf-8",
+    )
+
+    config_path = artifacts_dir / "prepared-config.json"
+    config_path.write_text("{}\n", encoding="utf-8")
+
+    launch_path = artifacts_dir / "prepared-launch.sh"
+    launch_path.write_text("#!/usr/bin/env sh\nexec \"$@\"\n", encoding="utf-8")
+
+    provenance_path = artifacts_dir / "executable-provenance.json"
+    provenance_path.write_text("{}\n", encoding="utf-8")
+
+    return SimpleNamespace(
+        prepared_launch_path=launch_path,
+        prepared_env_path=env_path,
+        prepared_config_path=config_path,
+        prepared_provenance_path=provenance_path,
+        prepared_config={"env_artifact": str(env_path)},
+        prepared_provenance={
+            "state": "resolved",
+            "prepared_path": "/prepared/bin/vox-box",
+        },
+        manifest_hash="manifest-vox-box-test",
+        prepared_environment_id=f"vox-box:{backend_version}",
+    )
 
 
 def _make_server(
@@ -130,14 +163,17 @@ def test_vox_box_server_does_not_support_distributed_direct_process():
     assert VoxBoxServer.supports_distributed_direct_process() is False
 
 
+def test_vox_box_server_declares_bootstrap_recipe_id():
+    """VoxBoxServer declares the shared bootstrap recipe id for prepared artifacts."""
+    assert VoxBoxServer.get_direct_process_bootstrap_recipe_id() == "vox-box"
+
+
 # ---------------------------------------------------------------------------
 # Command build
 # ---------------------------------------------------------------------------
 
 
-def test_direct_process_vox_box_command_starts_with_vox_box(
-    monkeypatch, tmp_path: Path
-):
+def test_direct_process_vox_box_command_starts_with_vox_box(tmp_path: Path):
     """Direct-process VoxBox command starts with ['vox-box', 'start', '--model', ...]."""
     server = _make_server(tmp_path)
 
@@ -186,9 +222,10 @@ def test_direct_process_vox_box_health_path():
 def test_direct_process_vox_box_launch_happy_path(
     monkeypatch, tmp_path: Path
 ):
-    """A valid direct-process VoxBox launch returns {pid, process_group_id, port, mode}."""
+    """A valid direct-process VoxBox launch consumes prepared artifacts and returns runtime metadata."""
     server = _make_server(tmp_path)
     observed: dict = {}
+    launch_artifacts = _make_launch_artifacts(tmp_path)
 
     class FakeProcess:
         pid = 7777
@@ -207,6 +244,11 @@ def test_direct_process_vox_box_launch_happy_path(
         lambda *_args, **_kwargs: _FakeSocket(),
     )
     monkeypatch.setattr(
+        server,
+        "resolve_direct_process_launch_artifacts",
+        lambda: launch_artifacts,
+    )
+    monkeypatch.setattr(
         "gpustack.worker.backends.vox_box.subprocess.Popen", fake_popen
     )
     monkeypatch.setattr(
@@ -221,13 +263,18 @@ def test_direct_process_vox_box_launch_happy_path(
         "port": 9000,
         "mode": DIRECT_PROCESS_RUNTIME_MODE,
     }
-    # Verify command was built correctly
-    assert observed["popen_args"][0] == "vox-box"
+    assert observed["popen_args"][0] == str(launch_artifacts.prepared_launch_path)
+    assert observed["popen_args"][1] == "__GPUSTACK_PREPARED_EXECUTABLE__"
     assert "start" in observed["popen_args"]
     assert "--model" in observed["popen_args"]
     assert "/models/test-vox-box-model" in observed["popen_args"]
-    # Verify env includes model env
     assert observed["popen_kwargs"]["env"]["CUSTOM_ENV"] == "enabled"
+    assert observed["popen_kwargs"]["env"]["PREPARED_ONLY"] == "from-artifact"
+    assert observed["popen_kwargs"]["env"]["GPUSTACK_PREPARED_EXECUTABLE"] == "/prepared/bin/vox-box"
+    assert (
+        observed["popen_kwargs"]["env"]["GPUSTACK_PREPARED_ENVIRONMENT_ID"]
+        == "vox-box:0.1.0"
+    )
     assert observed["popen_kwargs"]["stdin"] is not None
     assert observed["popen_kwargs"]["start_new_session"] in {True, False}
 
@@ -242,6 +289,7 @@ def test_direct_process_vox_box_result_has_exactly_four_keys(
 ):
     """Characterization: start_direct_process returns exactly {pid, process_group_id, port, mode}."""
     server = _make_server(tmp_path)
+    launch_artifacts = _make_launch_artifacts(tmp_path)
 
     class FakeProcess:
         pid = 1234
@@ -253,6 +301,11 @@ def test_direct_process_vox_box_result_has_exactly_four_keys(
     monkeypatch.setattr(
         "gpustack.worker.backends.vox_box.socket.socket",
         lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        server,
+        "resolve_direct_process_launch_artifacts",
+        lambda: launch_artifacts,
     )
     monkeypatch.setattr(
         "gpustack.worker.backends.vox_box.subprocess.Popen",
@@ -306,6 +359,13 @@ def test_direct_process_vox_box_rejects_distributed(
     """Direct-process VoxBox rejects all distributed deployment variants."""
     server = _make_server(tmp_path)
     server._get_deployment_metadata = lambda: deployment_metadata
+    resolve_calls = {"count": 0}
+
+    def fake_resolve_artifacts():
+        resolve_calls["count"] += 1
+        return _make_launch_artifacts(tmp_path)
+
+    monkeypatch.setattr(server, "resolve_direct_process_launch_artifacts", fake_resolve_artifacts)
 
     monkeypatch.setattr(
         "gpustack.worker.backends.vox_box.subprocess.Popen",
@@ -320,6 +380,8 @@ def test_direct_process_vox_box_rejects_distributed(
     ):
         server._start()
 
+    assert resolve_calls["count"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Preflight failure: missing executable
@@ -331,6 +393,7 @@ def test_direct_process_vox_box_preflight_fails_missing_executable(
 ):
     """Preflight raises RuntimeError when the executable is not found."""
     server = _make_server(tmp_path)
+    launch_artifacts = _make_launch_artifacts(tmp_path)
 
     monkeypatch.setattr(
         "gpustack.worker.backends.vox_box.shutil.which",
@@ -339,6 +402,11 @@ def test_direct_process_vox_box_preflight_fails_missing_executable(
     monkeypatch.setattr(
         "gpustack.worker.backends.vox_box.socket.socket",
         lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        server,
+        "resolve_direct_process_launch_artifacts",
+        lambda: launch_artifacts,
     )
     monkeypatch.setattr(
         "gpustack.worker.backends.vox_box.subprocess.Popen",
@@ -359,6 +427,7 @@ def test_direct_process_vox_box_preflight_fails_updates_state(
 ):
     """Preflight failure through start() updates model instance state to ERROR."""
     server = _make_server(tmp_path)
+    launch_artifacts = _make_launch_artifacts(tmp_path)
     updates = []
 
     def fake_update_model_instance(_id, **kwargs):
@@ -372,6 +441,11 @@ def test_direct_process_vox_box_preflight_fails_updates_state(
     monkeypatch.setattr(
         "gpustack.worker.backends.vox_box.socket.socket",
         lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        server,
+        "resolve_direct_process_launch_artifacts",
+        lambda: launch_artifacts,
     )
 
     with pytest.raises(RuntimeError):
@@ -392,6 +466,7 @@ def test_direct_process_vox_box_preflight_fails_port_bind(
 ):
     """Preflight raises RuntimeError when the port cannot be bound."""
     server = _make_server(tmp_path)
+    launch_artifacts = _make_launch_artifacts(tmp_path)
 
     class BindFailSocket:
         def bind(self, address):
@@ -407,6 +482,11 @@ def test_direct_process_vox_box_preflight_fails_port_bind(
     monkeypatch.setattr(
         "gpustack.worker.backends.vox_box.socket.socket",
         lambda *_args, **_kwargs: BindFailSocket(),
+    )
+    monkeypatch.setattr(
+        server,
+        "resolve_direct_process_launch_artifacts",
+        lambda: launch_artifacts,
     )
 
     with pytest.raises(
@@ -428,6 +508,7 @@ def test_direct_process_vox_box_preflight_fails_missing_directory(
     import shutil as _shutil
 
     server = _make_server(tmp_path)
+    launch_artifacts = _make_launch_artifacts(tmp_path)
 
     # Remove the serve log directory
     serve_log_dir = tmp_path / "data" / "log" / "serve"
@@ -440,6 +521,11 @@ def test_direct_process_vox_box_preflight_fails_missing_directory(
     monkeypatch.setattr(
         "gpustack.worker.backends.vox_box.socket.socket",
         lambda *_args, **_kwargs: _FakeSocket(),
+    )
+    monkeypatch.setattr(
+        server,
+        "resolve_direct_process_launch_artifacts",
+        lambda: launch_artifacts,
     )
 
     with pytest.raises(

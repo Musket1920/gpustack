@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class VoxBoxServer(InferenceServer):
+    _DIRECT_PROCESS_BOOTSTRAP_RECIPE_ID = "vox-box"
 
     # ------------------------------------------------------------------
     # Shared direct-process contract implementation
@@ -37,6 +38,10 @@ class VoxBoxServer(InferenceServer):
     @classmethod
     def supports_direct_process(cls) -> bool:
         return True
+
+    @classmethod
+    def get_direct_process_bootstrap_recipe_id(cls) -> Optional[str]:
+        return cls._DIRECT_PROCESS_BOOTSTRAP_RECIPE_ID
 
     @classmethod
     def supports_distributed_direct_process(cls) -> bool:
@@ -81,12 +86,33 @@ class VoxBoxServer(InferenceServer):
                 "Direct-process VoxBox does not support distributed launches."
             )
 
+        bootstrap_recipe_id = type(self).get_direct_process_bootstrap_recipe_id()
+        prepared_environment_id = self.get_direct_process_prepared_environment_identity()
+        launch_artifacts = self.resolve_direct_process_launch_artifacts()
+        self.require_resolved_direct_process_executable(launch_artifacts)
+
         port = self._get_serving_port()
-        env = self._get_configured_env()
-        command_args = self._build_command_args(port=port)
-        self._preflight_direct_process(command_args=command_args, env=env, port=port)
+        env = self.merge_direct_process_prepared_env_artifacts(
+            self._get_configured_env(),
+            launch_artifacts,
+        )
+        unwrapped_command_args = self._build_command_args(port=port)
+        command_args = self.build_direct_process_launch_wrapper_args(
+            launch_artifacts.prepared_launch_path,
+            unwrapped_command_args,
+            use_prepared_executable=True,
+        )
+        self._preflight_direct_process(
+            command_args=unwrapped_command_args,
+            env=env,
+            port=port,
+        )
 
         logger.info(f"Starting VoxBox direct process: {deployment_metadata.name}")
+        logger.info(
+            "Using direct-process bootstrap context: "
+            f"recipe={bootstrap_recipe_id}, prepared_environment={prepared_environment_id}"
+        )
         logger.info(
             f"With arguments: [{' '.join(command_args)}], "
             f"envs(inconsistent input items mean unchangeable):{os.linesep}"

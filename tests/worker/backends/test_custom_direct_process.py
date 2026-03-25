@@ -1,4 +1,5 @@
 import importlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -38,6 +39,75 @@ def _import_custom_module():
 custom_module = _import_custom_module()
 CustomServer = custom_module.CustomServer
 DIRECT_PROCESS_RUNTIME_MODE = custom_module.DIRECT_PROCESS_RUNTIME_MODE
+
+
+def _install_fake_launch_artifacts(server: CustomServer, tmp_path: Path):
+    prepared_root = tmp_path / "prepared" / "custom"
+    artifacts_root = prepared_root / "artifacts"
+    bin_root = prepared_root / "bin"
+    runtime_root = tmp_path / "runtime" / "1"
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+    bin_root.mkdir(parents=True, exist_ok=True)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    prepared_executable = bin_root / "my-server"
+    prepared_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    prepared_launch = artifacts_root / "prepared-launch.sh"
+    prepared_launch.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    prepared_env = artifacts_root / "prepared.env"
+    prepared_env.write_text(
+        "\n".join(
+            [
+                f"VIRTUAL_ENV={prepared_root / 'venv'}",
+                f"PATH={bin_root}${{PATH}}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prepared_provenance = artifacts_root / "executable-provenance.json"
+    prepared_provenance.write_text(
+        json.dumps(
+            {
+                "state": "resolved",
+                "name": "my-server",
+                "prepared_path": str(prepared_executable),
+                "sha256": "sha256:1234",
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared_config = artifacts_root / "prepared-config.json"
+    prepared_config.write_text(
+        json.dumps(
+            {
+                "backend": str(server._model.backend),
+                "backend_version": server._model.backend_version,
+                "prepared_cache_root": str(prepared_root),
+                "venv_root": str(prepared_root / "venv"),
+                "env_artifact": str(prepared_env),
+                "executable_provenance": str(prepared_provenance),
+                "manifest_hash": "manifest-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    launch_artifacts = SimpleNamespace(
+        prepared_launch_path=prepared_launch,
+        prepared_env_path=prepared_env,
+        prepared_config_path=prepared_config,
+        prepared_provenance_path=prepared_provenance,
+        prepared_config=json.loads(prepared_config.read_text(encoding="utf-8")),
+        prepared_provenance=json.loads(
+            prepared_provenance.read_text(encoding="utf-8")
+        ),
+        runtime_artifact_path=runtime_root / "bootstrap-artifact.json",
+        manifest_hash="manifest-123",
+        prepared_environment_id=server.get_direct_process_prepared_environment_identity(),
+    )
+    server.resolve_direct_process_launch_artifacts = lambda: launch_artifacts
+    return launch_artifacts
 
 
 class _FakeSocket:
@@ -146,6 +216,7 @@ def _make_server(
             distributed_follower=False,
         ),
     )
+    _install_fake_launch_artifacts(server, tmp_path)
     return server
 
 
@@ -162,6 +233,14 @@ def test_custom_server_supports_direct_process():
 def test_custom_server_does_not_support_distributed_direct_process():
     """CustomServer does not support distributed direct-process."""
     assert CustomServer.supports_distributed_direct_process() is False
+
+
+def test_custom_server_declares_recipe_backed_identity(tmp_path: Path):
+    """CustomServer uses the shared recipe-backed prepared environment identity."""
+    server = _make_server(tmp_path, contract=_make_contract())
+
+    assert CustomServer.get_direct_process_bootstrap_recipe_id() == "custom"
+    assert server.get_direct_process_prepared_environment_identity() == "custom:1.0.0"
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +294,11 @@ def test_direct_process_custom_launch_with_valid_contract(
         "stop_timeout_seconds": 30,
     }
     # Verify command was resolved correctly
-    assert observed["popen_args"][0] == "my-server"
-    assert "serve" in observed["popen_args"]
+    assert observed["popen_args"][:3] == [
+        str(tmp_path / "prepared" / "custom" / "artifacts" / "prepared-launch.sh"),
+        "__GPUSTACK_PREPARED_EXECUTABLE__",
+        "serve",
+    ]
     assert "/models/test-custom-model" in observed["popen_args"]
     assert "--port" in observed["popen_args"]
     assert "9000" in observed["popen_args"]
@@ -224,6 +306,8 @@ def test_direct_process_custom_launch_with_valid_contract(
     assert "127.0.0.1" in observed["popen_args"]
     # Verify env includes model env
     assert observed["popen_kwargs"]["env"]["CUSTOM_ENV"] == "enabled"
+    assert Path(observed["popen_kwargs"]["env"]["GPUSTACK_PREPARED_EXECUTABLE"]).name == "my-server"
+    assert str(tmp_path / "prepared" / "custom" / "bin") in observed["popen_kwargs"]["env"]["PATH"]
     assert observed["popen_kwargs"]["stdin"] is not None
     assert observed["popen_kwargs"]["start_new_session"] in {True, False}
 
@@ -448,11 +532,10 @@ def test_direct_process_custom_preflight_fails_missing_executable(
     """Preflight raises RuntimeError when the executable is not found."""
     contract = _make_contract()
     server = _make_server(tmp_path, contract=contract)
+    Path(server.resolve_direct_process_launch_artifacts().prepared_provenance[
+        "prepared_path"
+    ]).unlink()
 
-    monkeypatch.setattr(
-        "gpustack.worker.backends.custom.shutil.which",
-        lambda *_args, **_kwargs: None,
-    )
     monkeypatch.setattr(
         "gpustack.worker.backends.custom.socket.socket",
         lambda *_args, **_kwargs: _FakeSocket(),
@@ -477,16 +560,15 @@ def test_direct_process_custom_preflight_fails_missing_executable_updates_state(
     """Preflight failure through start() updates model instance state to ERROR."""
     contract = _make_contract()
     server = _make_server(tmp_path, contract=contract)
+    Path(server.resolve_direct_process_launch_artifacts().prepared_provenance[
+        "prepared_path"
+    ]).unlink()
     updates = []
 
     def fake_update_model_instance(_id, **kwargs):
         updates.append(kwargs)
 
     monkeypatch.setattr(server, "_update_model_instance", fake_update_model_instance)
-    monkeypatch.setattr(
-        "gpustack.worker.backends.custom.shutil.which",
-        lambda *_args, **_kwargs: None,
-    )
     monkeypatch.setattr(
         "gpustack.worker.backends.custom.socket.socket",
         lambda *_args, **_kwargs: _FakeSocket(),
@@ -623,6 +705,28 @@ def test_direct_process_custom_no_inference_backend_fails(
         server.start_direct_process()
 
 
+def test_direct_process_custom_distributed_launches_remain_unsupported(
+    tmp_path: Path,
+):
+    """Distributed custom direct-process stays fail-closed."""
+    server = _make_server(tmp_path, contract=_make_contract())
+    server._get_deployment_metadata = lambda: cast(
+        Any,
+        SimpleNamespace(
+            name="distributed-custom-instance",
+            distributed=True,
+            distributed_leader=True,
+            distributed_follower=False,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not support distributed launches",
+    ):
+        server.start_direct_process()
+
+
 # ---------------------------------------------------------------------------
 # Container mode is not affected
 # ---------------------------------------------------------------------------
@@ -694,6 +798,45 @@ def test_direct_process_custom_command_template_resolves_placeholders(
         "--ip",
         "127.0.0.1",
     ]
+
+
+def test_direct_process_custom_command_template_fails_on_unresolved_placeholder(
+    tmp_path: Path,
+):
+    """Contract validation fails early when command placeholders remain unresolved."""
+    contract = _make_contract(command_template="my-server --bad {{missing_value}}")
+    server = _make_server(tmp_path, contract=contract)
+
+    with pytest.raises(ValueError, match="unresolved placeholders"):
+        server.build_direct_process_command(port=9000)
+
+
+def test_direct_process_custom_env_template_fails_on_unresolved_placeholder(
+    tmp_path: Path,
+):
+    """Contract validation fails early when env placeholders remain unresolved."""
+    contract = _make_contract(env_template={"BROKEN_ENV": "{{missing_value}}"})
+    server = _make_server(tmp_path, contract=contract)
+
+    with pytest.raises(ValueError, match="unresolved placeholders"):
+        server.build_direct_process_env()
+
+
+def test_direct_process_custom_launch_fails_on_executable_provenance_mismatch(
+    monkeypatch, tmp_path: Path
+):
+    """Prepared executable provenance must match the contract executable."""
+    server = _make_server(tmp_path, contract=_make_contract())
+    launch_artifacts = server.resolve_direct_process_launch_artifacts()
+    launch_artifacts.prepared_provenance["name"] = "not-my-server"
+
+    monkeypatch.setattr(
+        "gpustack.worker.backends.custom.socket.socket",
+        lambda *_args, **_kwargs: _FakeSocket(),
+    )
+
+    with pytest.raises(RuntimeError, match="provenance name mismatch"):
+        server.start_direct_process()
 
 
 # ---------------------------------------------------------------------------

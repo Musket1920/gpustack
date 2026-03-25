@@ -1,4 +1,5 @@
 import importlib
+import json
 import logging
 from pathlib import Path
 import sys
@@ -33,6 +34,75 @@ def _import_llama_cpp_module():
 llama_cpp_module = _import_llama_cpp_module()
 LlamaCppServer = llama_cpp_module.LlamaCppServer
 DIRECT_PROCESS_RUNTIME_MODE = llama_cpp_module.DIRECT_PROCESS_RUNTIME_MODE
+
+
+def _install_fake_launch_artifacts(server: LlamaCppServer, tmp_path: Path):
+    prepared_root = tmp_path / "prepared" / "llama.cpp"
+    artifacts_root = prepared_root / "artifacts"
+    bin_root = prepared_root / "bin"
+    runtime_root = tmp_path / "runtime" / "1"
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+    bin_root.mkdir(parents=True, exist_ok=True)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    prepared_executable = bin_root / "llama-server"
+    prepared_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    prepared_launch = artifacts_root / "prepared-launch.sh"
+    prepared_launch.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    prepared_env = artifacts_root / "prepared.env"
+    prepared_env.write_text(
+        "\n".join(
+            [
+                f"VIRTUAL_ENV={prepared_root / 'venv'}",
+                f"PATH={bin_root}${{PATH}}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prepared_provenance = artifacts_root / "executable-provenance.json"
+    prepared_provenance.write_text(
+        json.dumps(
+            {
+                "state": "resolved",
+                "name": "llama-server",
+                "prepared_path": str(prepared_executable),
+                "sha256": "sha256:1234",
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared_config = artifacts_root / "prepared-config.json"
+    prepared_config.write_text(
+        json.dumps(
+            {
+                "backend": str(server._model.backend),
+                "backend_version": server._model.backend_version,
+                "prepared_cache_root": str(prepared_root),
+                "venv_root": str(prepared_root / "venv"),
+                "env_artifact": str(prepared_env),
+                "executable_provenance": str(prepared_provenance),
+                "manifest_hash": "manifest-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    launch_artifacts = SimpleNamespace(
+        prepared_launch_path=prepared_launch,
+        prepared_env_path=prepared_env,
+        prepared_config_path=prepared_config,
+        prepared_provenance_path=prepared_provenance,
+        prepared_config=json.loads(prepared_config.read_text(encoding="utf-8")),
+        prepared_provenance=json.loads(
+            prepared_provenance.read_text(encoding="utf-8")
+        ),
+        runtime_artifact_path=runtime_root / "bootstrap-artifact.json",
+        manifest_hash="manifest-123",
+        prepared_environment_id=server.get_direct_process_prepared_environment_identity(),
+    )
+    server.resolve_direct_process_launch_artifacts = lambda: launch_artifacts
+    return launch_artifacts
 
 
 class _FakeSocket:
@@ -80,7 +150,9 @@ def _make_server(
     server._model_instance = cast(
         Any,
         SimpleNamespace(
+            backend_version="cpu",
             id=1,
+            model_id=11,
             name="test-llama-cpp-instance",
             model_name="test-llama-cpp-model",
             port=9010,
@@ -110,6 +182,7 @@ def _make_server(
             distributed_follower=False,
         ),
     )
+    _install_fake_launch_artifacts(server, tmp_path)
     return server
 
 
@@ -119,6 +192,13 @@ def test_llama_cpp_server_supports_direct_process():
 
 def test_llama_cpp_server_does_not_support_distributed_direct_process():
     assert LlamaCppServer.supports_distributed_direct_process() is False
+
+
+def test_llama_cpp_server_direct_process_bootstrap_contract(tmp_path: Path):
+    server = _make_server(tmp_path)
+
+    assert LlamaCppServer.get_direct_process_bootstrap_recipe_id() == "llama.cpp"
+    assert server.get_direct_process_prepared_environment_identity() == "llama.cpp:cpu"
 
 
 def test_direct_process_llama_cpp_launch_command_uses_llama_server_and_health_contract(
@@ -187,15 +267,23 @@ def test_direct_process_llama_cpp_launch_happy_path(
         "mode": DIRECT_PROCESS_RUNTIME_MODE,
     }
     assert observed["popen_args"][:3] == [
-        "llama-server",
+        str(tmp_path / "prepared" / "llama.cpp" / "artifacts" / "prepared-launch.sh"),
+        "__GPUSTACK_PREPARED_EXECUTABLE__",
         "-m",
-        "/models/test-model.gguf",
     ]
+    assert "/models/test-model.gguf" in observed["popen_args"]
     assert "--host" in observed["popen_args"]
     assert "127.0.0.1" in observed["popen_args"]
     assert "--port" in observed["popen_args"]
     assert "9010" in observed["popen_args"]
     assert observed["popen_kwargs"]["env"]["CUSTOM_ENV"] == "enabled"
+    assert (
+        Path(observed["popen_kwargs"]["env"]["GPUSTACK_PREPARED_EXECUTABLE"]).name
+        == "llama-server"
+    )
+    assert str(tmp_path / "prepared" / "llama.cpp" / "bin") in observed[
+        "popen_kwargs"
+    ]["env"]["PATH"]
     assert observed["popen_kwargs"]["stdin"] is not None
     assert observed["popen_kwargs"]["start_new_session"] in {True, False}
 
@@ -239,7 +327,7 @@ def test_direct_process_llama_cpp_distributed_rejected(
 
     with pytest.raises(
         ValueError,
-        match="Direct-process llama\\.cpp does not support distributed launches",
+        match="Direct-process llama\\.cpp does not support distributed launches; only single-worker direct-process is implemented",
     ):
         server._start()
 
