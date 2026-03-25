@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import logging
 from pathlib import Path
 import aiohttp
 from fastapi import FastAPI
@@ -12,6 +13,9 @@ from gpustack.routes import ui
 from gpustack.routes.routes import api_router
 from gpustack.utils.forwarded import ForwardedHostPortMiddleware
 from gpustack.gateway.plugins import register as register_plugins
+
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(cfg: Config) -> FastAPI:
@@ -38,7 +42,14 @@ def create_app(cfg: Config) -> FastAPI:
         redoc_url=None if (cfg and cfg.disable_openapi_docs) else "/redoc",
         openapi_url=None if (cfg and cfg.disable_openapi_docs) else "/openapi.json",
     )
-    patch_docs(app, Path(__file__).parents[1] / "ui" / "static")
+    ui_static_dir = ui.get_ui_dir() / "static"
+    if ui_static_dir.is_dir():
+        patch_docs(app, ui_static_dir)
+    else:
+        logger.warning(
+            "UI static assets directory is missing; skipping docs asset patching: %s",
+            ui_static_dir,
+        )
     app.add_middleware(ForwardedHostPortMiddleware)
     app.add_middleware(middlewares.RequestTimeMiddleware)
     app.add_middleware(middlewares.ModelUsageMiddleware)
