@@ -27,6 +27,7 @@ from gpustack.schemas.workers import (
     DIRECT_PROCESS_BACKENDS_LABEL,
     DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL,
     DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL,
+    OperatingSystemInfo,
 )
 from tests.fixtures.workers.fixtures import linux_nvidia_4_4080_16gx4
 from tests.policies.worker_filters.test_backend_framework_filter import (
@@ -106,6 +107,33 @@ async def test_direct_process_rejects_non_linux_worker_with_clear_message():
     assert len(filtered_workers) == 0
     assert len(messages) == 1
     assert "Direct process mode is supported only on Linux workers." in messages[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_os_name", "label_os"),
+    [
+        pytest.param("Ubuntu", "linux", id="linux-label-overrides-linux-distro-name"),
+        pytest.param("Linux", "windows", id="linux-status-name-wins-over-nonlinux-label"),
+    ],
+)
+async def test_direct_process_accepts_linux_like_worker_platform_names(
+    status_os_name,
+    label_os,
+):
+    model = create_model(backend="vLLM", backend_version="0.13.0")
+    worker = linux_nvidia_4_4080_16gx4()
+    worker_status = worker.status
+    assert worker_status is not None
+    worker_status.os = OperatingSystemInfo(name=status_os_name, version="")
+    worker.labels["os"] = label_os
+    _enable_direct_process(worker, backends="vLLM")
+
+    filtered_workers, messages = await BackendFrameworkFilter(model).filter([worker])
+
+    assert len(filtered_workers) == 1
+    assert filtered_workers[0].name == worker.name
+    assert len(messages) == 0
 
 
 @pytest.mark.asyncio

@@ -64,6 +64,43 @@ class BackendFrameworkFilter(WorkerFilter):
             return worker_platform.lower()
         return ""
 
+    def _is_linux_platform_name(self, platform_name: Optional[str]) -> bool:
+        if not platform_name:
+            return False
+
+        normalized_name = platform_name.strip().lower()
+        return normalized_name == "linux" or "linux" in normalized_name or normalized_name in {
+            "ubuntu",
+            "debian",
+            "centos",
+            "rhel",
+            "red hat",
+            "redhat",
+            "fedora",
+            "rocky",
+            "almalinux",
+            "amzn",
+            "amazon linux",
+            "arch",
+            "manjaro",
+            "opensuse",
+            "suse",
+            "alpine",
+        }
+
+    def _is_linux_worker(self, worker: Worker) -> bool:
+        status_os_name = None
+        if worker.status and worker.status.os:
+            status_os_name = worker.status.os.name
+
+        label_os_name = None
+        if worker.labels:
+            label_os_name = worker.labels.get("os")
+
+        return self._is_linux_platform_name(status_os_name) or self._is_linux_platform_name(
+            label_os_name
+        )
+
     def _get_worker_gpu_count(self, worker: Worker) -> int:
         if not worker.status or not worker.status.gpu_devices:
             return 0
@@ -125,7 +162,7 @@ class BackendFrameworkFilter(WorkerFilter):
                 f"backend '{self.backend_name}'."
             )
 
-        if self._get_worker_platform_name(worker) != "linux":
+        if not self._is_linux_worker(worker):
             return DIRECT_PROCESS_MODE_UNSUPPORTED_PLATFORM_MESSAGE
 
         requested_world_size = self._get_requested_direct_process_world_size()
