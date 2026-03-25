@@ -1,7 +1,7 @@
 import os
 import secrets
 from enum import Enum
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, cast
 from urllib.parse import urlparse
 import ipaddress
 import httpx
@@ -106,7 +106,16 @@ class Config(WorkerConfig, BaseSettings):
         benchmark_dir: Directory to store benchmark results.
         benchmark_max_duration_seconds: Max duration for a benchmark before timeout. Disabled when unset.
         direct_process_mode: Enable worker direct-process runtime mode.
-        distributed_direct_process_vllm: Enable feature-flagged distributed direct-process scheduling/gating for vLLM workers.
+         distributed_direct_process_vllm: Enable feature-flagged distributed direct-process scheduling/gating for vLLM workers.
+         enable_host_bootstrap: Enable the explicit host-bootstrap control plane on the worker.
+         host_bootstrap_dry_run: Force host-bootstrap requests to report actions without mutating host state.
+         host_bootstrap_allowed_recipe_sources: Allowlisted host-bootstrap recipe source prefixes or exact values.
+         bootstrap_dir: Directory to store shared bootstrap state roots.
+         bootstrap_cache_dir: Directory to store prepared bootstrap environment caches.
+         bootstrap_workspace_dir: Directory to store bootstrap runtime workspaces.
+        bootstrap_artifacts_dir: Directory to store generated bootstrap artifacts.
+        bootstrap_manifests_dir: Directory to store generated bootstrap manifests.
+        bootstrap_locks_dir: Directory to store bootstrap lock files.
         pipx_path: Path to the pipx executable, used to install versioned backends.
         system_reserved: Reserved system resources.
         tools_download_base_url: Base URL to download dependency tools.
@@ -197,6 +206,15 @@ class Config(WorkerConfig, BaseSettings):
     grafana_url: Optional[str] = None
     grafana_worker_dashboard_uid: Optional[str] = "gpustack-worker"
     grafana_model_dashboard_uid: Optional[str] = "gpustack-model"
+    enable_host_bootstrap: bool = False
+    host_bootstrap_dry_run: bool = False
+    host_bootstrap_allowed_recipe_sources: Optional[List[str]] = None
+    bootstrap_dir: Optional[str] = None
+    bootstrap_cache_dir: Optional[str] = None
+    bootstrap_workspace_dir: Optional[str] = None
+    bootstrap_artifacts_dir: Optional[str] = None
+    bootstrap_manifests_dir: Optional[str] = None
+    bootstrap_locks_dir: Optional[str] = None
 
     _set_worker_fields = {}
 
@@ -226,6 +244,27 @@ class Config(WorkerConfig, BaseSettings):
         self.log_dir = prepare_dir(self.log_dir, os.path.join(self.data_dir, "log"))
         self.benchmark_dir = prepare_dir(
             self.benchmark_dir, os.path.join(self.data_dir, "benchmarks")
+        )
+        self.bootstrap_dir = prepare_dir(
+            self.bootstrap_dir, os.path.join(self.data_dir, "bootstrap")
+        )
+        self.bootstrap_cache_dir = prepare_dir(
+            self.bootstrap_cache_dir, os.path.join(self.cache_dir, "bootstrap")
+        )
+        self.bootstrap_workspace_dir = prepare_dir(
+            self.bootstrap_workspace_dir,
+            os.path.join(self.bootstrap_dir, "workspaces"),
+        )
+        self.bootstrap_artifacts_dir = prepare_dir(
+            self.bootstrap_artifacts_dir,
+            os.path.join(self.bootstrap_dir, "artifacts"),
+        )
+        self.bootstrap_manifests_dir = prepare_dir(
+            self.bootstrap_manifests_dir,
+            os.path.join(self.bootstrap_dir, "manifests"),
+        )
+        self.bootstrap_locks_dir = prepare_dir(
+            self.bootstrap_locks_dir, os.path.join(self.bootstrap_dir, "locks")
         )
         if isinstance(self.grafana_url, str) and not self.grafana_url.strip():
             self.grafana_url = None
@@ -271,6 +310,9 @@ class Config(WorkerConfig, BaseSettings):
 
     @model_validator(mode="after")
     def check_all(self):  # noqa: C901
+        return self._check_all()
+
+    def _check_all(self):  # noqa: C901
         if 'PYTEST_CURRENT_TEST' in os.environ:
             # Skip validation during tests
             return self
@@ -333,11 +375,17 @@ class Config(WorkerConfig, BaseSettings):
                 )
 
     def make_dirs(self):
-        os.makedirs(self.data_dir, exist_ok=True)
-        os.makedirs(self.cache_dir, exist_ok=True)
-        os.makedirs(self.bin_dir, exist_ok=True)
-        os.makedirs(self.log_dir, exist_ok=True)
-        os.makedirs(self.benchmark_dir, exist_ok=True)
+        os.makedirs(cast(str, self.data_dir), exist_ok=True)
+        os.makedirs(cast(str, self.cache_dir), exist_ok=True)
+        os.makedirs(cast(str, self.bin_dir), exist_ok=True)
+        os.makedirs(cast(str, self.log_dir), exist_ok=True)
+        os.makedirs(cast(str, self.benchmark_dir), exist_ok=True)
+        os.makedirs(cast(str, self.bootstrap_dir), exist_ok=True)
+        os.makedirs(cast(str, self.bootstrap_cache_dir), exist_ok=True)
+        os.makedirs(cast(str, self.bootstrap_workspace_dir), exist_ok=True)
+        os.makedirs(cast(str, self.bootstrap_artifacts_dir), exist_ok=True)
+        os.makedirs(cast(str, self.bootstrap_manifests_dir), exist_ok=True)
+        os.makedirs(cast(str, self.bootstrap_locks_dir), exist_ok=True)
         # prepare gateway dirs
         os.makedirs(
             os.getenv("GPUSTACK_GATEWAY_DIR", self.higress_base_dir()),
@@ -346,7 +394,7 @@ class Config(WorkerConfig, BaseSettings):
         # ensure higress data dir exists
         os.makedirs(self.higress_base_dir(), exist_ok=True)
 
-    def get_system_info(self) -> SystemInfo:  # noqa: C901
+    def get_system_info(self) -> Optional[SystemInfo]:  # noqa: C901
         """get system info from resources
         resource example:
         ```yaml
@@ -469,7 +517,7 @@ class Config(WorkerConfig, BaseSettings):
 
         return system_info
 
-    def get_gpu_devices(self) -> GPUDevicesStatus:  # noqa: C901
+    def get_gpu_devices(self) -> Optional[GPUDevicesStatus]:  # noqa: C901
         """get gpu devices from resources
         resource example:
         ```yaml
@@ -629,13 +677,14 @@ class Config(WorkerConfig, BaseSettings):
         if self.jwt_secret_key is not None:
             return
 
-        key_path = os.path.join(self.data_dir, "jwt_secret_key")
+        data_dir = cast(str, self.data_dir)
+        key_path = os.path.join(data_dir, "jwt_secret_key")
         if os.path.exists(key_path):
             with open(key_path, "r") as file:
                 key = file.read().strip()
         else:
             key = secrets.token_hex(32)
-            os.makedirs(self.data_dir, exist_ok=True)
+            os.makedirs(data_dir, exist_ok=True)
             with open(key_path, "w") as file:
                 file.write(key)
 
@@ -645,10 +694,10 @@ class Config(WorkerConfig, BaseSettings):
         return self.server_url is not None
 
     def postgres_base_dir(self) -> str:
-        return os.path.join(self.data_dir, "postgresql")
+        return os.path.join(cast(str, self.data_dir), "postgresql")
 
     def higress_base_dir(self) -> str:
-        return os.path.join(self.data_dir, "higress")
+        return os.path.join(cast(str, self.data_dir), "higress")
 
     def detect_gateway_mode(self):
         if self.gateway_mode == GatewayModeEnum.auto:
@@ -717,7 +766,9 @@ class Config(WorkerConfig, BaseSettings):
         # As of v2.0.1, a `bootstrap_version` file is created in data_dir.
         # If the file exists, it indicates that the server was installed
         # using a version that defaults to running server-only mode.
-        bootstrap_version_path = os.path.join(self.data_dir, "bootstrap_version")
+        bootstrap_version_path = os.path.join(
+            cast(str, self.data_dir), "bootstrap_version"
+        )
         if os.path.exists(bootstrap_version_path):
             return False
 
@@ -764,24 +815,26 @@ class Config(WorkerConfig, BaseSettings):
 
     def get_api_port(self, embedded_worker: bool = False) -> int:
         if embedded_worker:
-            return self.worker_port
+            return cast(int, self.worker_port)
         if self.server_role() != self.ServerRole.WORKER:
-            return self.api_port
-        return (
+            return cast(int, self.api_port)
+        return cast(
+            int,
             self.api_port
             if self.gateway_mode == GatewayModeEnum.embedded
-            else self.worker_port
+            else self.worker_port,
         )
 
     def get_gateway_port(self) -> int:
-        return (
+        return cast(
+            int,
             self.port
             if self.server_role() != self.ServerRole.WORKER
             else self.worker_port
         )
 
     def reload_token(self):
-        token = read_registration_token(self.data_dir)
+        token = read_registration_token(cast(str, self.data_dir))
         if token:
             self.token = token
 
@@ -795,7 +848,7 @@ class Config(WorkerConfig, BaseSettings):
         for key, value in updated.items():
             if key in self.__class__.model_fields:
                 setattr(self, key, value)
-        self.check_all()
+        self._check_all()
 
     def get_system_reserved(self) -> Dict[str, int]:
         system_reserved_in_bytes = {**(self.system_reserved or {})}
@@ -865,6 +918,7 @@ def get_openid_configuration(issuer: str) -> dict:
 
 
 def get_global_config() -> Config:
+    assert _config is not None
     return _config
 
 
