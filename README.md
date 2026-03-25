@@ -67,24 +67,31 @@ This fork also includes an experimental worker option for operators who already 
 
 Container deployment remains supported, and it is still the default and recommended GPUStack path. Treat direct-process mode as a fork-only operator workflow, not an official upstream GPUStack feature.
 
-Direct-process mode is enabled per worker with `GPUSTACK_DIRECT_PROCESS_MODE=true`. In Part 2, the worker advertises direct-process capabilities for the backends it can launch, but the runtime mode is still worker-global. A worker is either in container mode or in direct-process mode for all deployments placed on that worker.
+Direct-process mode is enabled per worker with `GPUSTACK_DIRECT_PROCESS_MODE=true`. The worker advertises direct-process capabilities for the backends it can launch, but the runtime mode is still worker-global. A worker is either in container mode or in direct-process mode for all deployments placed on that worker.
 
-Part 2 backend coverage in this fork:
+Recipe-backed provisioning is now the bootstrap path for supported direct-process backends. Before launch, bootstrap resolves a recipe-backed prepared environment, installs or validates its consumed artifacts under a reusable prepared cache, and records live launch inputs such as `prepared.env`, `prepared-config.json`, `prepared-launch.sh`, executable provenance, and provisioning audit data.
 
-- built-in single-worker direct-process support for `vLLM`, `SGLang`, `MindIE`, and `VoxBox`
-- first-class single-worker direct-process support for `llama.cpp`
-- generic `custom backend` direct-process support for community backends that fit the custom command, env, health, timeout, workdir, and stop contract
-- distributed direct-process support for `vLLM` only in this phase
+Keep prepared cache ownership and runtime workspace ownership separate. The prepared cache is keyed by backend recipe and version so compatible launches can reuse prepared artifacts safely. The runtime workspace is keyed by deployment and model instance so `ServeManager` can keep logs, ports, runtime manifests, and process state isolated for each direct-process instance.
+
+Bootstrap remains preparatory only. It does not replace `ServeManager`, it does not own runtime lifecycle state, and it does not become the runtime control plane. `ServeManager` and `process_registry` remain the runtime authority for direct-process serving.
+
+Host bootstrap is a separate control path for operators who need audited host preparation. It is disabled by default, Linux-only, dry-run capable, allowlisted by recipe source, and hash-pinned for declared inputs. Normal direct-process serving does not silently mutate the host.
+
+Current backend matrix in this phase:
+
+- distributed direct-process support for `vLLM`, `SGLang`, and `MindIE` only
+- single-worker recipe-backed parity for `llama.cpp`, `VoxBox`, and `custom backend`
+- the distributed direct-process subset still uses the existing worker-wide enablement gate, and its current config and env naming remain legacy `vLLM`-oriented names
 
 Current limits and non-goals:
 
 - Linux worker only
 - container mode remains supported alongside this worker option, but not mixed on the same worker
-- non-`vLLM` distributed direct-process is out of scope in Part 2
+- distributed direct-process for `llama.cpp`, `VoxBox`, and `custom backend` is out of scope in this phase and must fail closed instead of degrading or implying broader support
 - benchmark direct-process runs are out of scope
 - `custom backend` does not imply support for every external backend, only for backends that satisfy the documented contract
 
-When this mode is enabled, the worker expects host-side prerequisites that container deployment normally hides. That includes the backend executable for the selected direct-process path, the required Python and GPU runtime libraries, writable worker directories, and the localhost ports needed for readiness checks.
+When this mode is enabled, the worker still needs the expected host-side prerequisites. That includes the backend executable for the selected direct-process path, the required Python and GPU runtime libraries, writable worker directories, and the localhost ports needed for readiness checks.
 
 Direct-process instances use file logs as the canonical log source at `gpustack/logs/serve/<model-instance-id>.log`. On worker restart, this fork uses a cleanup-and-recreate policy. It kills stale direct-process entries and starts clean instead of trying to reattach to an existing serving process.
 
@@ -164,8 +171,11 @@ Fork-only direct-process workflow for a worker that is already running in a Linu
 1. Start the worker with `GPUSTACK_DIRECT_PROCESS_MODE=true` in its environment.
 2. Make sure the worker environment already has the backend executable you plan to use, such as `vllm`, `sglang`, `mindie`, `vox-box`, `llama-server`, or a `custom backend` command that matches the documented contract, plus the required host GPU libraries.
 3. Keep the worker on the normal container-based registration path so it still connects to the GPUStack server in the usual way.
-4. Deploy single-worker direct-process models for the backends that worker advertises. Use distributed direct-process only for `vLLM` in this phase.
-5. Read direct-process serve logs from `gpustack/logs/serve/<model-instance-id>.log` if launch or readiness fails.
+4. Let bootstrap prepare or reuse the recipe-backed prepared cache for that backend and version, then let `ServeManager` launch the instance in its own runtime workspace.
+5. Deploy direct-process workloads only for the backends and topologies that worker advertises. Distributed direct-process covers `vLLM`, `SGLang`, and `MindIE` only. `llama.cpp`, `VoxBox`, and `custom backend` remain single-worker only in this phase, and unsupported distributed requests must fail closed.
+   That distributed subset still depends on the existing worker-wide distributed direct-process enablement switch, even though its current config and env name is legacy `vLLM` naming.
+6. Use host bootstrap only through its explicit operator control path when you need audited host preparation. It stays default-off, supports dry-run, and rejects recipe sources or inputs that are not allowlisted and hash-pinned.
+7. Read direct-process serve logs from `gpustack/logs/serve/<model-instance-id>.log` if launch or readiness fails.
 
 ### Deploy a Model
 
