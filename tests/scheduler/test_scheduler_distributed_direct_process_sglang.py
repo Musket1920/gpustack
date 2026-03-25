@@ -12,6 +12,8 @@ if "fcntl" not in sys.modules:
 
 from gpustack.policies.base import ModelInstanceScheduleCandidate
 from gpustack.scheduler.scheduler import _filter_unsupported_direct_process_candidates
+import pytest
+
 from gpustack.schemas.models import (
     BackendEnum,
     ComputedResourceClaim,
@@ -24,10 +26,18 @@ from tests.fixtures.workers.fixtures import (
 from tests.utils.model import new_model
 
 
-def _enable_direct_process(worker, *, backend: str, distributed: bool = False):
+def _enable_direct_process(
+    worker,
+    *,
+    backend: str,
+    bootstrap: bool = False,
+    distributed: bool = False,
+):
     labels = worker.labels or {}
     labels["gpustack.direct-process-mode"] = "true"
     labels["gpustack.direct-process-backends"] = backend
+    if bootstrap:
+        labels["gpustack.direct-process-bootstrap-backends"] = backend
     if distributed:
         labels["gpustack.direct-process-distributed-backends"] = backend
     worker.labels = labels
@@ -56,40 +66,22 @@ def _make_multi_worker_candidate(workers):
     )
 
 
-def test_distributed_direct_process_vllm_scheduler_requires_capable_workers():
+def test_distributed_direct_process_sglang_scheduler_allows_capable_workers():
     workers = [
         _enable_direct_process(
-            linux_nvidia_22_H100_80gx8(), backend="vLLM", distributed=True
+            linux_nvidia_22_H100_80gx8(),
+            backend="SGLang",
+            bootstrap=True,
+            distributed=True,
         ),
         _enable_direct_process(
-            linux_nvidia_23_H100_80gx8(), backend="vLLM", distributed=False
+            linux_nvidia_23_H100_80gx8(),
+            backend="SGLang",
+            bootstrap=True,
+            distributed=True,
         ),
     ]
-    model = new_model(
-        1,
-        "distributed-vllm",
-        1,
-        huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct",
-        backend=BackendEnum.VLLM,
-        distributed_inference_across_workers=True,
-    )
-
-    candidates, messages = _filter_unsupported_direct_process_candidates(
-        model,
-        workers,
-        [_make_multi_worker_candidate(workers)],
-    )
-
-    assert candidates == []
-    assert any("distributed vLLM support" in message for message in messages)
-    assert any(workers[1].name in message for message in messages)
-
-
-def test_distributed_direct_process_non_vllm_rejected_in_scheduler():
-    workers = [
-        _enable_direct_process(linux_nvidia_22_H100_80gx8(), backend="SGLang"),
-        _enable_direct_process(linux_nvidia_23_H100_80gx8(), backend="SGLang"),
-    ]
+    candidate = _make_multi_worker_candidate(workers)
     model = new_model(
         1,
         "distributed-sglang",
@@ -102,8 +94,80 @@ def test_distributed_direct_process_non_vllm_rejected_in_scheduler():
     candidates, messages = _filter_unsupported_direct_process_candidates(
         model,
         workers,
-        [_make_multi_worker_candidate(workers)],
+        [candidate],
+    )
+
+    assert candidates == [candidate]
+    assert messages == []
+
+
+def test_distributed_direct_process_sglang_scheduler_requires_distributed_capability():
+    workers = [
+        _enable_direct_process(
+            linux_nvidia_22_H100_80gx8(),
+            backend="SGLang",
+            bootstrap=True,
+            distributed=True,
+        ),
+        _enable_direct_process(
+            linux_nvidia_23_H100_80gx8(),
+            backend="SGLang",
+            bootstrap=True,
+            distributed=False,
+        ),
+    ]
+    candidate = _make_multi_worker_candidate(workers)
+    model = new_model(
+        1,
+        "distributed-sglang",
+        1,
+        huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct",
+        backend=BackendEnum.SGLANG,
+        distributed_inference_across_workers=True,
+    )
+
+    candidates, messages = _filter_unsupported_direct_process_candidates(
+        model,
+        workers,
+        [candidate],
     )
 
     assert candidates == []
     assert any("distributed SGLang support" in message for message in messages)
+    assert any(workers[1].name in message for message in messages)
+
+
+def test_distributed_direct_process_scheduler_rejects_unsupported_backend():
+    workers = [
+        _enable_direct_process(
+            linux_nvidia_22_H100_80gx8(),
+            backend="VoxBox",
+            bootstrap=True,
+            distributed=True,
+        ),
+        _enable_direct_process(
+            linux_nvidia_23_H100_80gx8(),
+            backend="VoxBox",
+            bootstrap=True,
+            distributed=True,
+        ),
+    ]
+    candidate = _make_multi_worker_candidate(workers)
+    model = new_model(
+        1,
+        "distributed-unsupported",
+        1,
+        huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct",
+        backend=BackendEnum.VOX_BOX,
+        distributed_inference_across_workers=True,
+    )
+
+    candidates, messages = _filter_unsupported_direct_process_candidates(
+        model,
+        workers,
+        [candidate],
+    )
+
+    assert candidates == []
+    assert any("contract-declared backends" in message for message in messages)
+    assert any("VoxBox" in message for message in messages)

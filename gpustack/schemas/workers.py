@@ -13,19 +13,19 @@ from sqlmodel import (
     ForeignKey,
 )
 from sqlalchemy import String
-from gpustack import envs
-from gpustack.mixins import BaseModelMixin
 from gpustack.schemas.common import (
     ListParams,
     PaginatedList,
     UTCDateTime,
     pydantic_column_type,
 )
+from gpustack import envs
+from gpustack.mixins import BaseModelMixin
 from typing import List
 from sqlalchemy.orm import declarative_base
 
 from gpustack.utils.network import is_offline
-from .clusters import ClusterProvider, Cluster, WorkerPool
+from gpustack.schemas.clusters import ClusterProvider, Cluster, WorkerPool
 from gpustack.schemas.config import (
     PredefinedConfigNoDefaults,
     ModelInstanceProxyModeEnum,
@@ -397,7 +397,7 @@ class WorkerBase(WorkerCreate):
 
 
 class Worker(WorkerBase, BaseModelMixin, table=True):
-    __tablename__ = 'workers'
+    __tablename__ = 'workers'  # type: ignore
     id: Optional[int] = Field(default=None, primary_key=True)
 
     cluster: Cluster = Relationship(
@@ -471,13 +471,11 @@ class WorkerPublic(
     me: Optional[bool] = None  # Indicates if the worker is the current worker
     provision_progress: Optional[str] = None  # Indicates the provisioning progress
 
-    worker_uuid: Optional[str] = Field(default=None, exclude=True)
     machine_id: Optional[str] = Field(default=None, exclude=True)
 
 
 class WorkerRegistrationPublic(WorkerPublic):
     token: str
-    worker_uuid: str
     worker_config: Optional["PredefinedConfigNoDefaults"] = None
 
 
@@ -494,8 +492,14 @@ WorkersPublic = PaginatedList[WorkerPublic]
 # ---------------------------------------------------------------------------
 
 DIRECT_PROCESS_BACKENDS_LABEL = "gpustack.direct-process-backends"
+DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL = (
+    "gpustack.direct-process-bootstrap-backends"
+)
 DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL = (
     "gpustack.direct-process-distributed-backends"
+)
+DIRECT_PROCESS_HOST_BOOTSTRAP_BACKENDS_LABEL = (
+    "gpustack.direct-process-host-bootstrap-backends"
 )
 DIRECT_PROCESS_CUSTOM_CONTRACT_LABEL = "gpustack.direct-process-custom-contract"
 
@@ -514,8 +518,16 @@ class DirectProcessCapabilities(BaseModel):
     single_worker_backends: List[str] = Field(default_factory=list)
     """Backend names that support single-worker direct-process on this worker."""
 
+    bootstrap_ready_backends: List[str] = Field(default_factory=list)
+    """Backend names whose direct-process bootstrap prerequisites are ready on this
+    worker."""
+
     distributed_backends: List[str] = Field(default_factory=list)
     """Backend names that support distributed (multi-worker) direct-process."""
+
+    host_bootstrap_backends: List[str] = Field(default_factory=list)
+    """Backend names that support an explicit host-bootstrap control path on this
+    worker."""
 
     custom_contract_support: bool = False
     """Whether the worker supports the generic custom/community direct-process
@@ -544,9 +556,19 @@ class DirectProcessCapabilities(BaseModel):
             b.strip() for b in single_raw.split(",") if b.strip()
         ]
 
+        bootstrap_raw = labels.get(DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL, "")
+        bootstrap_backends = [
+            b.strip() for b in bootstrap_raw.split(",") if b.strip()
+        ]
+
         dist_raw = labels.get(DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL, "")
         distributed_backends = [
             b.strip() for b in dist_raw.split(",") if b.strip()
+        ]
+
+        host_bootstrap_raw = labels.get(DIRECT_PROCESS_HOST_BOOTSTRAP_BACKENDS_LABEL, "")
+        host_bootstrap_backends = [
+            b.strip() for b in host_bootstrap_raw.split(",") if b.strip()
         ]
 
         custom_val = labels.get(DIRECT_PROCESS_CUSTOM_CONTRACT_LABEL, "")
@@ -555,7 +577,9 @@ class DirectProcessCapabilities(BaseModel):
         return cls(
             enabled=True,
             single_worker_backends=single_backends,
+            bootstrap_ready_backends=bootstrap_backends,
             distributed_backends=distributed_backends,
+            host_bootstrap_backends=host_bootstrap_backends,
             custom_contract_support=custom_support,
         )
 
@@ -565,9 +589,17 @@ class DirectProcessCapabilities(BaseModel):
         """Check if this worker supports single-worker direct-process for *backend*."""
         return self.enabled and backend in self.single_worker_backends
 
+    def supports_bootstrap_backend(self, backend: str) -> bool:
+        """Check if this worker is bootstrap-ready for *backend*."""
+        return self.enabled and backend in self.bootstrap_ready_backends
+
     def supports_distributed_backend(self, backend: str) -> bool:
         """Check if this worker supports distributed direct-process for *backend*."""
         return self.enabled and backend in self.distributed_backends
+
+    def supports_host_bootstrap_backend(self, backend: str) -> bool:
+        """Check if this worker supports explicit host-bootstrap for *backend*."""
+        return self.enabled and backend in self.host_bootstrap_backends
 
     # -- label production -------------------------------------------------
 
@@ -583,9 +615,17 @@ class DirectProcessCapabilities(BaseModel):
             labels[DIRECT_PROCESS_BACKENDS_LABEL] = ",".join(
                 sorted(self.single_worker_backends)
             )
+        if self.bootstrap_ready_backends:
+            labels[DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL] = ",".join(
+                sorted(self.bootstrap_ready_backends)
+            )
         if self.distributed_backends:
             labels[DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL] = ",".join(
                 sorted(self.distributed_backends)
+            )
+        if self.host_bootstrap_backends:
+            labels[DIRECT_PROCESS_HOST_BOOTSTRAP_BACKENDS_LABEL] = ",".join(
+                sorted(self.host_bootstrap_backends)
             )
         if self.custom_contract_support:
             labels[DIRECT_PROCESS_CUSTOM_CONTRACT_LABEL] = "true"

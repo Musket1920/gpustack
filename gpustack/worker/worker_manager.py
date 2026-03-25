@@ -1,6 +1,7 @@
 import os
 import logging
-from typing import Optional, Tuple
+import sys
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 from gpustack.client import ClientSet
 from gpustack.client.worker_manager_clients import (
@@ -17,11 +18,6 @@ from gpustack.schemas.workers import (
 from gpustack.schemas.config import PredefinedConfigNoDefaults
 from gpustack.security import API_KEY_PREFIX
 from gpustack.utils import platform
-from gpustack.worker.collector import WorkerStatusCollector
-from gpustack.worker.direct_process import (
-    get_direct_process_supported_backends,
-    get_direct_process_distributed_backends,
-)
 from gpustack.config.registration import (
     registration_client,
     read_worker_token,
@@ -33,6 +29,15 @@ from gpustack.utils.uuid import (
     set_legacy_uuid,
     get_legacy_uuid,
 )
+from gpustack.worker.bootstrap_manager import (
+    BootstrapManager,
+    HostBootstrapAction,
+    HostBootstrapRequest,
+    HostBootstrapResult,
+)
+
+if TYPE_CHECKING:
+    from gpustack.worker.collector import WorkerStatusCollector
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +46,11 @@ DIRECT_PROCESS_MODE_LABEL = "gpustack.direct-process-mode"
 
 class WorkerManager:
     _is_embedded: bool
-    _collector: WorkerStatusCollector
+    _collector: "WorkerStatusCollector"
     _clientset: Optional[ClientSet] = None
     _registration_client: Optional[WorkerRegistrationClient] = None
     _status_client: Optional[WorkerStatusClient] = None
+    _bootstrap_manager: Optional[BootstrapManager] = None
 
     @property
     def _data_dir(self) -> str:
@@ -56,7 +62,7 @@ class WorkerManager:
         self,
         cfg: Config,
         is_embedded: bool,
-        collector: WorkerStatusCollector,
+        collector: "WorkerStatusCollector",
     ):
         self._is_embedded = is_embedded
         self._cfg = cfg
@@ -152,6 +158,26 @@ class WorkerManager:
     def _register_shutdown_hooks(self):
         pass
 
+    def _get_bootstrap_manager(self) -> BootstrapManager:
+        manager = self._bootstrap_manager
+        if manager is None:
+            manager = BootstrapManager(self._cfg)
+            self._bootstrap_manager = manager
+        return manager
+
+    def execute_host_bootstrap(
+        self,
+        request: HostBootstrapRequest,
+        *,
+        mutate_action: Callable[[HostBootstrapAction], None] | None = None,
+        dry_run: bool | None = None,
+    ) -> HostBootstrapResult:
+        return self._get_bootstrap_manager().execute_host_bootstrap(
+            request,
+            mutate_action=mutate_action,
+            dry_run=dry_run,
+        )
+
     def _ensure_builtin_labels(self) -> dict:
         labels = {
             "os": platform.system(),
@@ -188,11 +214,33 @@ class WorkerManager:
         returned object is converted to labels via ``to_labels()`` and merged
         into the worker's label set.
         """
+        from gpustack.worker.direct_process import (
+            _get_direct_process_backend_contracts,
+            get_direct_process_distributed_backends,
+            get_direct_process_supported_backends,
+        )
+
         single_backends = sorted(get_direct_process_supported_backends())
         distributed_backends = sorted(get_direct_process_distributed_backends(self._cfg))
+        bootstrap_backends = sorted(
+            backend
+            for backend, server_cls in _get_direct_process_backend_contracts().items()
+            if backend in single_backends
+            and server_cls.get_direct_process_bootstrap_recipe_id()
+        )
+        host_bootstrap_backends = (
+            single_backends
+            if getattr(self._cfg, "enable_host_bootstrap", False)
+            and sys.platform.lower().startswith(
+                BootstrapManager.HOST_BOOTSTRAP_SUPPORTED_PLATFORMS
+            )
+            else []
+        )
         return DirectProcessCapabilities(
             enabled=True,
             single_worker_backends=single_backends,
+            bootstrap_ready_backends=bootstrap_backends,
             distributed_backends=distributed_backends,
+            host_bootstrap_backends=host_bootstrap_backends,
             custom_contract_support=True,
         )

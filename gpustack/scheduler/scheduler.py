@@ -20,16 +20,6 @@ from gpustack.policies.base import (
     ModelInstanceScheduleCandidate,
     WorkerFilterChain,
 )
-from gpustack.policies.candidate_selectors import (
-    AscendMindIEResourceFitSelector,
-    GGUFResourceFitSelector,
-    SGLangResourceFitSelector,
-    VLLMResourceFitSelector,
-    VoxBoxResourceFitSelector,
-)
-from gpustack.policies.candidate_selectors.custom_backend_resource_fit_selector import (
-    CustomBackendResourceFitSelector,
-)
 from gpustack.policies.utils import ListMessageBuilder
 from gpustack.policies.worker_filters.backend_framework_filter import (
     BackendFrameworkFilter,
@@ -81,12 +71,31 @@ from sqlalchemy.orm.attributes import flag_modified
 
 logger = logging.getLogger(__name__)
 
-DIRECT_PROCESS_DISTRIBUTED_VLLM_CANDIDATE_MESSAGE = (
-    "Distributed vLLM direct process scheduling requires every selected worker to advertise distributed vLLM support."
+DIRECT_PROCESS_DISTRIBUTED_SUPPORTED_BACKENDS = (
+    BackendEnum.VLLM,
+    BackendEnum.SGLANG,
+    BackendEnum.ASCEND_MINDIE,
 )
-DIRECT_PROCESS_DISTRIBUTED_NON_VLLM_CANDIDATE_MESSAGE = (
-    "Direct process mode supports distributed scheduling only for the vLLM backend."
-)
+
+
+def _build_distributed_direct_process_candidate_message(backend: str) -> str:
+    return (
+        f"Distributed {backend} direct process scheduling requires every selected worker "
+        f"to be bootstrap-ready for {backend} and advertise distributed {backend} support."
+    )
+
+
+def _build_unsupported_distributed_direct_process_candidate_message(
+    backend: str,
+) -> str:
+    supported_backends = ", ".join(
+        str(supported_backend)
+        for supported_backend in DIRECT_PROCESS_DISTRIBUTED_SUPPORTED_BACKENDS
+    )
+    return (
+        "Direct process mode supports distributed scheduling only for the "
+        f"contract-declared backends ({supported_backends}). Got '{backend}'."
+    )
 
 
 class Scheduler:
@@ -426,27 +435,43 @@ async def find_candidate(
     # Initialize candidate selector.
     try:
         if is_gguf_model(model):
+            from gpustack.policies.candidate_selectors import GGUFResourceFitSelector
+
             candidates_selector = GGUFResourceFitSelector(
                 model, model_instances, config.cache_dir
             )
         elif model.backend == BackendEnum.VOX_BOX:
+            from gpustack.policies.candidate_selectors import VoxBoxResourceFitSelector
+
             candidates_selector = VoxBoxResourceFitSelector(
                 config, model, model_instances, config.cache_dir
             )
         elif model.backend == BackendEnum.ASCEND_MINDIE:
+            from gpustack.policies.candidate_selectors import (
+                AscendMindIEResourceFitSelector,
+            )
+
             candidates_selector = AscendMindIEResourceFitSelector(
                 config, model, model_instances
             )
         elif model.backend == BackendEnum.VLLM and not is_omni_model(model):
             # Note: Route omni categories to CustomSelector for vLLM-Omni.
+            from gpustack.policies.candidate_selectors import VLLMResourceFitSelector
+
             candidates_selector = VLLMResourceFitSelector(
                 config, model, model_instances
             )
         elif model.backend == BackendEnum.SGLANG:
+            from gpustack.policies.candidate_selectors import SGLangResourceFitSelector
+
             candidates_selector = SGLangResourceFitSelector(
                 config, model, model_instances
             )
         else:
+            from gpustack.policies.candidate_selectors.custom_backend_resource_fit_selector import (
+                CustomBackendResourceFitSelector,
+            )
+
             candidates_selector = CustomBackendResourceFitSelector(
                 config, model, model_instances
             )
@@ -530,21 +555,41 @@ def _filter_unsupported_direct_process_candidates(
             continue
 
         backend = get_backend(model)
-        if backend != BackendEnum.VLLM:
+        if backend not in DIRECT_PROCESS_DISTRIBUTED_SUPPORTED_BACKENDS:
             messages.append(
-                f"Candidate filtered out: {DIRECT_PROCESS_DISTRIBUTED_NON_VLLM_CANDIDATE_MESSAGE} Got '{backend}'."
+                "Candidate filtered out: "
+                + _build_unsupported_distributed_direct_process_candidate_message(
+                    backend
+                )
+            )
+            continue
+
+        distributed_candidate_message = (
+            _build_distributed_direct_process_candidate_message(backend)
+        )
+
+        bootstrap_unready_workers = [
+            worker.name
+            for worker, cap in zip(involved_workers, capabilities)
+            if not cap.supports_bootstrap_backend(backend)
+        ]
+        if bootstrap_unready_workers:
+            messages.append(
+                "Candidate filtered out: "
+                f"{distributed_candidate_message} "
+                f"Bootstrap-unready workers: {', '.join(bootstrap_unready_workers)}."
             )
             continue
 
         unsupported_workers = [
             worker.name
             for worker, cap in zip(involved_workers, capabilities)
-            if not cap.supports_distributed_backend(BackendEnum.VLLM)
+            if not cap.supports_distributed_backend(backend)
         ]
         if unsupported_workers:
             messages.append(
                 "Candidate filtered out: "
-                f"{DIRECT_PROCESS_DISTRIBUTED_VLLM_CANDIDATE_MESSAGE} "
+                f"{distributed_candidate_message} "
                 f"Unsupported workers: {', '.join(unsupported_workers)}."
             )
             continue
@@ -939,13 +984,30 @@ def set_model_gpus_per_replica(model: Model) -> bool:
         # User-specified world size from backend parameters takes precedence.
         if model.backend_parameters is not None:
             selector_map = {
-                BackendEnum.VLLM.value: VLLMResourceFitSelector,
-                BackendEnum.ASCEND_MINDIE.value: AscendMindIEResourceFitSelector,
-                BackendEnum.SGLANG.value: SGLangResourceFitSelector,
+                BackendEnum.VLLM.value: "vllm",
+                BackendEnum.ASCEND_MINDIE.value: "ascend_mindie",
+                BackendEnum.SGLANG.value: "sglang",
             }
-            selector = selector_map.get(model.backend)
+            selector_key = selector_map.get(model.backend)
             world_size = None
-            if selector:
+            if selector_key == "vllm":
+                from gpustack.policies.candidate_selectors import VLLMResourceFitSelector
+
+                selector = VLLMResourceFitSelector
+            elif selector_key == "ascend_mindie":
+                from gpustack.policies.candidate_selectors import (
+                    AscendMindIEResourceFitSelector,
+                )
+
+                selector = AscendMindIEResourceFitSelector
+            elif selector_key == "sglang":
+                from gpustack.policies.candidate_selectors import SGLangResourceFitSelector
+
+                selector = SGLangResourceFitSelector
+            else:
+                selector = None
+
+            if selector is not None:
                 result = selector.get_world_size_from_backend_parameters(model)
                 world_size, _ = result if result is not None else (None, None)
             if world_size and world_size > 0:

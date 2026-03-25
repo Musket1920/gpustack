@@ -1,6 +1,7 @@
 import sys
 import types
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -20,7 +21,9 @@ from gpustack.config.config import Config
 from gpustack.schemas.workers import (
     DirectProcessCapabilities,
     DIRECT_PROCESS_BACKENDS_LABEL,
+    DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL,
     DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL,
+    DIRECT_PROCESS_HOST_BOOTSTRAP_BACKENDS_LABEL,
     DIRECT_PROCESS_CUSTOM_CONTRACT_LABEL,
 )
 from gpustack.worker.worker_manager import (
@@ -29,8 +32,31 @@ from gpustack.worker.worker_manager import (
 )
 
 
-def make_config(tmp_path: Path, direct_process_mode: bool) -> Config:
-    return Config(
+CURRENT_DIRECT_PROCESS_BACKENDS = [
+    "Custom",
+    "MindIE",
+    "SGLang",
+    "VoxBox",
+    "llama.cpp",
+    "vLLM",
+]
+CURRENT_DISTRIBUTED_DIRECT_PROCESS_BACKENDS = ["MindIE", "SGLang", "vLLM"]
+CURRENT_BOOTSTRAP_READY_DIRECT_PROCESS_BACKENDS = [
+    "Custom",
+    "MindIE",
+    "SGLang",
+    "VoxBox",
+    "llama.cpp",
+    "vLLM",
+]
+
+
+def make_config(
+    tmp_path: Path,
+    direct_process_mode: bool,
+    **overrides,
+) -> Config:
+    defaults = dict(
         token="test",
         jwt_secret_key="test",
         data_dir=str(tmp_path),
@@ -39,6 +65,8 @@ def make_config(tmp_path: Path, direct_process_mode: bool) -> Config:
         distributed_direct_process_vllm=False,
         worker_name="worker-1",
     )
+    defaults.update(overrides)
+    return Config(**defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -73,16 +101,20 @@ class TestDirectProcessCapabilityLabels:
     """Verify that _ensure_builtin_labels() populates per-backend capability
     labels when direct_process_mode is enabled."""
 
-    def test_direct_process_enabled_includes_backends_label(self, tmp_path: Path):
+    def test_direct_process_enabled_advertises_current_backend_set(
+        self, tmp_path: Path
+    ):
         manager = object.__new__(WorkerManager)
         manager._cfg = make_config(tmp_path, direct_process_mode=True)
 
         labels = manager._ensure_builtin_labels()
 
-        # The backends label must be present and contain at least vLLM
-        assert DIRECT_PROCESS_BACKENDS_LABEL in labels
-        backends = labels[DIRECT_PROCESS_BACKENDS_LABEL].split(",")
-        assert "vLLM" in backends
+        assert labels[DIRECT_PROCESS_BACKENDS_LABEL] == ",".join(
+            CURRENT_DIRECT_PROCESS_BACKENDS
+        )
+        assert labels[DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL] == ",".join(
+            CURRENT_BOOTSTRAP_READY_DIRECT_PROCESS_BACKENDS
+        )
 
     def test_direct_process_disabled_omits_capability_labels(self, tmp_path: Path):
         manager = object.__new__(WorkerManager)
@@ -91,7 +123,9 @@ class TestDirectProcessCapabilityLabels:
         labels = manager._ensure_builtin_labels()
 
         assert DIRECT_PROCESS_BACKENDS_LABEL not in labels
+        assert DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL not in labels
         assert DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL not in labels
+        assert DIRECT_PROCESS_HOST_BOOTSTRAP_BACKENDS_LABEL not in labels
         assert DIRECT_PROCESS_CUSTOM_CONTRACT_LABEL not in labels
 
     def test_distributed_backends_label_empty_when_flag_disabled(
@@ -104,6 +138,48 @@ class TestDirectProcessCapabilityLabels:
         labels = manager._ensure_builtin_labels()
 
         assert DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL not in labels
+
+    def test_host_bootstrap_backends_label_absent_until_explicitly_enabled(
+        self, tmp_path: Path
+    ):
+        manager = object.__new__(WorkerManager)
+        manager._cfg = make_config(tmp_path, direct_process_mode=True)
+
+        labels = manager._ensure_builtin_labels()
+
+        assert DIRECT_PROCESS_HOST_BOOTSTRAP_BACKENDS_LABEL not in labels
+
+    def test_host_bootstrap_backends_label_present_when_explicitly_enabled_on_linux(
+        self, tmp_path: Path
+    ):
+        manager = object.__new__(WorkerManager)
+        manager._cfg = make_config(
+            tmp_path,
+            direct_process_mode=True,
+            enable_host_bootstrap=True,
+        )
+
+        with patch("gpustack.worker.worker_manager.sys.platform", "linux"):
+            labels = manager._ensure_builtin_labels()
+
+        assert labels[DIRECT_PROCESS_HOST_BOOTSTRAP_BACKENDS_LABEL] == ",".join(
+            CURRENT_DIRECT_PROCESS_BACKENDS
+        )
+
+    def test_host_bootstrap_backends_label_absent_on_unsupported_platform(
+        self, tmp_path: Path
+    ):
+        manager = object.__new__(WorkerManager)
+        manager._cfg = make_config(
+            tmp_path,
+            direct_process_mode=True,
+            enable_host_bootstrap=True,
+        )
+
+        with patch("gpustack.worker.worker_manager.sys.platform", "darwin"):
+            labels = manager._ensure_builtin_labels()
+
+        assert DIRECT_PROCESS_HOST_BOOTSTRAP_BACKENDS_LABEL not in labels
 
     def test_custom_contract_label_present_after_task_6(self, tmp_path: Path):
         """Custom contract support is enabled (task 6 implemented)."""
@@ -124,33 +200,104 @@ class TestDirectProcessCapabilityLabels:
 
         assert labels[DIRECT_PROCESS_MODE_LABEL] == "true"
         assert DIRECT_PROCESS_BACKENDS_LABEL in labels
+        assert DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL in labels
 
     def test_backends_label_sorted_deterministic(self, tmp_path: Path):
         """When multiple backends are supported, the label value must be
         sorted for deterministic comparison."""
-        fake_single = frozenset({"vLLM", "SGLang", "VoxBox"})
+        fake_single = frozenset({"SGLang", "VoxBox"})
+        fake_distributed = frozenset({"vLLM"})
         manager = object.__new__(WorkerManager)
         manager._cfg = make_config(tmp_path, direct_process_mode=True)
 
         with patch(
-            "gpustack.worker.worker_manager.get_direct_process_supported_backends",
+            "gpustack.worker.direct_process.get_direct_process_supported_backends",
             return_value=fake_single,
+        ), patch(
+            "gpustack.worker.direct_process.get_direct_process_distributed_backends",
+            return_value=fake_distributed,
         ):
             labels = manager._ensure_builtin_labels()
 
-        assert labels[DIRECT_PROCESS_BACKENDS_LABEL] == "SGLang,VoxBox,vLLM"
+        assert labels[DIRECT_PROCESS_BACKENDS_LABEL] == "SGLang,VoxBox"
+        assert labels[DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL] == "SGLang,VoxBox"
 
     def test_distributed_backends_label_present_when_registry_nonempty(
         self, tmp_path: Path
     ):
-        """The feature flag enables distributed vLLM capability labels."""
+        """The feature flag enables the contract-derived distributed capability labels."""
         manager = object.__new__(WorkerManager)
         manager._cfg = make_config(tmp_path, direct_process_mode=True)
         manager._cfg.distributed_direct_process_vllm = True
 
         labels = manager._ensure_builtin_labels()
 
-        assert labels[DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL] == "vLLM"
+        assert labels[DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL] == ",".join(
+            CURRENT_DISTRIBUTED_DIRECT_PROCESS_BACKENDS
+        )
+        assert labels[DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL] == ",".join(
+            CURRENT_BOOTSTRAP_READY_DIRECT_PROCESS_BACKENDS
+        )
+
+    def test_distributed_capability_remains_subset_of_advertised_backends(
+        self, tmp_path: Path
+    ):
+        manager = object.__new__(WorkerManager)
+        manager._cfg = make_config(tmp_path, direct_process_mode=True)
+        manager._cfg.distributed_direct_process_vllm = True
+
+        labels = manager._ensure_builtin_labels()
+
+        assert labels[DIRECT_PROCESS_BACKENDS_LABEL].split(",") == (
+            CURRENT_DIRECT_PROCESS_BACKENDS
+        )
+        assert labels[DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL].split(",") == (
+            CURRENT_BOOTSTRAP_READY_DIRECT_PROCESS_BACKENDS
+        )
+        assert labels[DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL].split(",") == (
+            CURRENT_DISTRIBUTED_DIRECT_PROCESS_BACKENDS
+        )
+        assert set(labels[DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL].split(",")).issubset(
+            set(labels[DIRECT_PROCESS_BACKENDS_LABEL].split(","))
+        )
+        assert set(labels[DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL].split(",")).issubset(
+            set(labels[DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL].split(","))
+        )
+
+
+class TestWorkerManagerHostBootstrapControlPath:
+    def test_execute_host_bootstrap_delegates_to_bootstrap_manager(self, tmp_path: Path):
+        manager = object.__new__(WorkerManager)
+        manager._cfg = make_config(tmp_path, direct_process_mode=True)
+
+        request = cast(Any, object())
+        sentinel = object()
+        mutate_action = lambda _action: None
+
+        class BootstrapManagerStub:
+            def __init__(self):
+                self.calls = []
+
+            def execute_host_bootstrap(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return sentinel
+
+        bootstrap_manager = BootstrapManagerStub()
+        manager._bootstrap_manager = cast(Any, bootstrap_manager)
+
+        result = manager.execute_host_bootstrap(
+            request,
+            mutate_action=mutate_action,
+            dry_run=True,
+        )
+
+        assert result is sentinel
+        assert bootstrap_manager.calls == [
+            (
+                (request,),
+                {"mutate_action": mutate_action, "dry_run": True},
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +313,9 @@ class TestDirectProcessCapabilitiesFromLabels:
         caps = DirectProcessCapabilities.from_labels(None)
         assert caps.enabled is False
         assert caps.single_worker_backends == []
+        assert caps.bootstrap_ready_backends == []
         assert caps.distributed_backends == []
+        assert caps.host_bootstrap_backends == []
         assert caps.custom_contract_support is False
 
     def test_empty_labels_returns_disabled(self):
@@ -178,26 +327,80 @@ class TestDirectProcessCapabilitiesFromLabels:
         caps = DirectProcessCapabilities.from_labels(labels)
         assert caps.enabled is False
         assert caps.single_worker_backends == []
+        assert caps.bootstrap_ready_backends == []
 
     def test_mode_label_true_without_backends_returns_enabled_empty(self):
         labels = {DIRECT_PROCESS_MODE_LABEL: "true"}
         caps = DirectProcessCapabilities.from_labels(labels)
         assert caps.enabled is True
         assert caps.single_worker_backends == []
+        assert caps.bootstrap_ready_backends == []
         assert caps.distributed_backends == []
+        assert caps.host_bootstrap_backends == []
 
     def test_full_capability_labels_parsed(self):
         labels = {
             DIRECT_PROCESS_MODE_LABEL: "true",
-            DIRECT_PROCESS_BACKENDS_LABEL: "SGLang,VoxBox,vLLM",
-            DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL: "vLLM",
+            DIRECT_PROCESS_BACKENDS_LABEL: ",".join(CURRENT_DIRECT_PROCESS_BACKENDS),
+            DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL: ",".join(
+                CURRENT_BOOTSTRAP_READY_DIRECT_PROCESS_BACKENDS
+            ),
+            DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL: ",".join(
+                CURRENT_DISTRIBUTED_DIRECT_PROCESS_BACKENDS
+            ),
+            DIRECT_PROCESS_HOST_BOOTSTRAP_BACKENDS_LABEL: "vLLM",
             DIRECT_PROCESS_CUSTOM_CONTRACT_LABEL: "true",
         }
         caps = DirectProcessCapabilities.from_labels(labels)
         assert caps.enabled is True
-        assert caps.single_worker_backends == ["SGLang", "VoxBox", "vLLM"]
-        assert caps.distributed_backends == ["vLLM"]
+        assert caps.single_worker_backends == CURRENT_DIRECT_PROCESS_BACKENDS
+        assert (
+            caps.bootstrap_ready_backends
+            == CURRENT_BOOTSTRAP_READY_DIRECT_PROCESS_BACKENDS
+        )
+        assert caps.distributed_backends == CURRENT_DISTRIBUTED_DIRECT_PROCESS_BACKENDS
+        assert caps.host_bootstrap_backends == ["vLLM"]
         assert caps.custom_contract_support is True
+
+    def test_current_worker_advertisement_labels_parse_into_expected_capabilities(self):
+        labels = {
+            DIRECT_PROCESS_MODE_LABEL: "true",
+            DIRECT_PROCESS_BACKENDS_LABEL: ",".join(CURRENT_DIRECT_PROCESS_BACKENDS),
+            DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL: ",".join(
+                CURRENT_BOOTSTRAP_READY_DIRECT_PROCESS_BACKENDS
+            ),
+            DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL: ",".join(
+                CURRENT_DISTRIBUTED_DIRECT_PROCESS_BACKENDS
+            ),
+            DIRECT_PROCESS_CUSTOM_CONTRACT_LABEL: "true",
+        }
+
+        caps = DirectProcessCapabilities.from_labels(labels)
+
+        assert caps.enabled is True
+        assert caps.single_worker_backends == CURRENT_DIRECT_PROCESS_BACKENDS
+        assert (
+            caps.bootstrap_ready_backends
+            == CURRENT_BOOTSTRAP_READY_DIRECT_PROCESS_BACKENDS
+        )
+        assert caps.distributed_backends == CURRENT_DISTRIBUTED_DIRECT_PROCESS_BACKENDS
+        assert caps.host_bootstrap_backends == []
+        assert caps.custom_contract_support is True
+
+    def test_bootstrap_backends_fail_closed_when_label_absent(self):
+        labels = {
+            DIRECT_PROCESS_MODE_LABEL: "true",
+            DIRECT_PROCESS_BACKENDS_LABEL: "SGLang,VoxBox",
+            DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL: "vLLM",
+        }
+
+        caps = DirectProcessCapabilities.from_labels(labels)
+
+        assert caps.enabled is True
+        assert caps.single_worker_backends == ["SGLang", "VoxBox"]
+        assert caps.bootstrap_ready_backends == []
+        assert caps.distributed_backends == ["vLLM"]
+        assert caps.host_bootstrap_backends == []
 
     def test_backends_with_whitespace_trimmed(self):
         labels = {
@@ -206,6 +409,15 @@ class TestDirectProcessCapabilitiesFromLabels:
         }
         caps = DirectProcessCapabilities.from_labels(labels)
         assert caps.single_worker_backends == ["vLLM", "SGLang"]
+        assert caps.bootstrap_ready_backends == []
+
+    def test_host_bootstrap_backends_with_whitespace_trimmed(self):
+        labels = {
+            DIRECT_PROCESS_MODE_LABEL: "1",
+            DIRECT_PROCESS_HOST_BOOTSTRAP_BACKENDS_LABEL: " vLLM , SGLang ",
+        }
+        caps = DirectProcessCapabilities.from_labels(labels)
+        assert caps.host_bootstrap_backends == ["vLLM", "SGLang"]
 
     def test_mode_label_yes_accepted(self):
         labels = {DIRECT_PROCESS_MODE_LABEL: "yes"}
@@ -229,7 +441,7 @@ class TestDirectProcessCapabilitiesFromLabels:
 
 
 class TestDirectProcessCapabilitiesQueries:
-    """Verify supports_backend() and supports_distributed_backend() helpers."""
+    """Verify backend, bootstrap, and distributed capability helpers."""
 
     def test_supports_backend_true(self):
         caps = DirectProcessCapabilities(
@@ -260,6 +472,28 @@ class TestDirectProcessCapabilitiesQueries:
         )
         assert caps.supports_distributed_backend("vLLM") is True
 
+    def test_supports_bootstrap_backend_true(self):
+        caps = DirectProcessCapabilities(
+            enabled=True,
+            bootstrap_ready_backends=["vLLM", "SGLang"],
+        )
+        assert caps.supports_bootstrap_backend("vLLM") is True
+        assert caps.supports_bootstrap_backend("SGLang") is True
+
+    def test_supports_bootstrap_backend_false_for_unlisted(self):
+        caps = DirectProcessCapabilities(
+            enabled=True,
+            bootstrap_ready_backends=["vLLM"],
+        )
+        assert caps.supports_bootstrap_backend("MindIE") is False
+
+    def test_supports_bootstrap_backend_false_when_disabled(self):
+        caps = DirectProcessCapabilities(
+            enabled=False,
+            bootstrap_ready_backends=["vLLM"],
+        )
+        assert caps.supports_bootstrap_backend("vLLM") is False
+
     def test_supports_distributed_backend_false_for_unlisted(self):
         caps = DirectProcessCapabilities(
             enabled=True,
@@ -273,6 +507,20 @@ class TestDirectProcessCapabilitiesQueries:
             distributed_backends=["vLLM"],
         )
         assert caps.supports_distributed_backend("vLLM") is False
+
+    def test_supports_host_bootstrap_backend_true(self):
+        caps = DirectProcessCapabilities(
+            enabled=True,
+            host_bootstrap_backends=["vLLM"],
+        )
+        assert caps.supports_host_bootstrap_backend("vLLM") is True
+
+    def test_supports_host_bootstrap_backend_false_when_disabled(self):
+        caps = DirectProcessCapabilities(
+            enabled=False,
+            host_bootstrap_backends=["vLLM"],
+        )
+        assert caps.supports_host_bootstrap_backend("vLLM") is False
 
 
 # ---------------------------------------------------------------------------
@@ -291,9 +539,13 @@ class TestDirectProcessCapabilitiesToLabels:
         caps = DirectProcessCapabilities(
             enabled=True,
             single_worker_backends=["VoxBox", "vLLM", "SGLang"],
+            bootstrap_ready_backends=["VoxBox", "vLLM", "SGLang"],
         )
         labels = caps.to_labels()
         assert labels[DIRECT_PROCESS_BACKENDS_LABEL] == "SGLang,VoxBox,vLLM"
+        assert (
+            labels[DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL] == "SGLang,VoxBox,vLLM"
+        )
 
     def test_distributed_backends_produce_label(self):
         caps = DirectProcessCapabilities(
@@ -302,6 +554,14 @@ class TestDirectProcessCapabilitiesToLabels:
         )
         labels = caps.to_labels()
         assert labels[DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL] == "vLLM"
+
+    def test_host_bootstrap_backends_produce_label(self):
+        caps = DirectProcessCapabilities(
+            enabled=True,
+            host_bootstrap_backends=["vLLM"],
+        )
+        labels = caps.to_labels()
+        assert labels[DIRECT_PROCESS_HOST_BOOTSTRAP_BACKENDS_LABEL] == "vLLM"
 
     def test_custom_contract_produces_label(self):
         caps = DirectProcessCapabilities(
@@ -316,7 +576,9 @@ class TestDirectProcessCapabilitiesToLabels:
         original = DirectProcessCapabilities(
             enabled=True,
             single_worker_backends=["SGLang", "vLLM"],
+            bootstrap_ready_backends=["SGLang", "vLLM"],
             distributed_backends=["vLLM"],
+            host_bootstrap_backends=["vLLM"],
             custom_contract_support=True,
         )
         labels = original.to_labels()
@@ -326,7 +588,9 @@ class TestDirectProcessCapabilitiesToLabels:
         restored = DirectProcessCapabilities.from_labels(labels)
         assert restored.enabled is True
         assert sorted(restored.single_worker_backends) == ["SGLang", "vLLM"]
+        assert sorted(restored.bootstrap_ready_backends) == ["SGLang", "vLLM"]
         assert restored.distributed_backends == ["vLLM"]
+        assert restored.host_bootstrap_backends == ["vLLM"]
         assert restored.custom_contract_support is True
 
 
@@ -347,11 +611,15 @@ class TestDirectProcessCapabilitiesFailSafe:
         caps = DirectProcessCapabilities.from_labels(labels)
         assert caps.enabled is False
         assert caps.single_worker_backends == []
+        assert caps.bootstrap_ready_backends == []
+        assert caps.host_bootstrap_backends == []
 
     def test_garbage_mode_label_means_no_capability(self):
         labels = {DIRECT_PROCESS_MODE_LABEL: "maybe"}
         caps = DirectProcessCapabilities.from_labels(labels)
         assert caps.enabled is False
+        assert caps.bootstrap_ready_backends == []
+        assert caps.host_bootstrap_backends == []
 
     def test_empty_backends_string_means_no_backends(self):
         labels = {
@@ -361,6 +629,8 @@ class TestDirectProcessCapabilitiesFailSafe:
         caps = DirectProcessCapabilities.from_labels(labels)
         assert caps.enabled is True
         assert caps.single_worker_backends == []
+        assert caps.bootstrap_ready_backends == []
+        assert caps.host_bootstrap_backends == []
 
     def test_comma_only_backends_string_means_no_backends(self):
         labels = {
@@ -370,10 +640,14 @@ class TestDirectProcessCapabilitiesFailSafe:
         caps = DirectProcessCapabilities.from_labels(labels)
         assert caps.enabled is True
         assert caps.single_worker_backends == []
+        assert caps.bootstrap_ready_backends == []
+        assert caps.host_bootstrap_backends == []
 
     def test_supports_backend_on_default_instance_is_false(self):
         """Default-constructed capabilities should deny everything."""
         caps = DirectProcessCapabilities()
         assert caps.supports_backend("vLLM") is False
+        assert caps.supports_bootstrap_backend("vLLM") is False
         assert caps.supports_distributed_backend("vLLM") is False
+        assert caps.supports_host_bootstrap_backend("vLLM") is False
         assert caps.custom_contract_support is False

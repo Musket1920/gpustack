@@ -42,6 +42,7 @@ from gpustack.utils.process import add_signal_handlers_in_loop
 from gpustack.utils.system_check import check_glibc_version
 from gpustack.utils.task import run_periodically_in_thread
 from gpustack.worker.benchmark_manager import BenchmarkManager
+from gpustack.worker.bootstrap_manager import BootstrapManager
 from gpustack.worker.inference_backend_manager import InferenceBackendManager
 from gpustack.worker.model_file_manager import ModelFileManager
 from gpustack.worker.runtime_metrics_aggregator import RuntimeMetricsAggregator
@@ -67,6 +68,7 @@ class Worker:
     _status_collector: WorkerStatusCollector
     _worker_manager: WorkerManager
     _serve_manager: ServeManager
+    _bootstrap_manager: BootstrapManager
     _benchmark_manager: BenchmarkManager
     _workload_cleaner: WorkloadCleaner
     _config: Config
@@ -112,6 +114,7 @@ class Worker:
         self._worker_ip, self._worker_ifname = self._detect_worker_ip_and_ifname()
 
         self._runtime_metrics_cache = defaultdict()
+        self._bootstrap_manager = BootstrapManager(cfg)
 
         self._status_collector = WorkerStatusCollector(
             cfg=cfg,
@@ -141,6 +144,7 @@ class Worker:
             worker_id_getter=self.worker_id,
             clientset_getter=self.clientset,
             cfg=self._config,
+            bootstrap_manager=self._bootstrap_manager,
         )
 
         self._benchmark_manager = BenchmarkManager(

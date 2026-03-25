@@ -25,6 +25,7 @@ from gpustack.policies.worker_filters.backend_framework_filter import (
 from gpustack.schemas.models import BackendEnum
 from gpustack.schemas.workers import (
     DIRECT_PROCESS_BACKENDS_LABEL,
+    DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL,
     DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL,
 )
 from tests.fixtures.workers.fixtures import linux_nvidia_4_4080_16gx4
@@ -49,6 +50,11 @@ def _enable_direct_process(worker, backends=None):
 def _enable_distributed_direct_process(worker, backends="vLLM"):
     assert worker.labels is not None
     worker.labels[DIRECT_PROCESS_DISTRIBUTED_BACKENDS_LABEL] = backends
+
+
+def _enable_bootstrap_ready_direct_process(worker, backends="vLLM"):
+    assert worker.labels is not None
+    worker.labels[DIRECT_PROCESS_BOOTSTRAP_BACKENDS_LABEL] = backends
 
 
 # ── existing characterization tests (updated for capability labels) ──────
@@ -117,11 +123,11 @@ async def test_direct_process_rejects_multi_worker_vllm_path_with_clear_message(
 
     assert len(filtered_workers) == 0
     assert len(messages) == 1
-    assert "disabled on this worker" in messages[0]
+    assert "not bootstrap-ready on this worker" in messages[0]
 
 
 @pytest.mark.asyncio
-async def test_distributed_direct_process_vllm_feature_flagged_worker_passes_filter():
+async def test_distributed_direct_process_vllm_bootstrap_ready_worker_passes_filter():
     model = create_model(
         backend="vLLM",
         backend_version="0.13.0",
@@ -129,6 +135,7 @@ async def test_distributed_direct_process_vllm_feature_flagged_worker_passes_fil
     )
     worker = linux_nvidia_4_4080_16gx4()
     _enable_direct_process(worker, backends="vLLM")
+    _enable_bootstrap_ready_direct_process(worker)
     _enable_distributed_direct_process(worker)
 
     filtered_workers, messages = await BackendFrameworkFilter(model).filter([worker])
@@ -138,19 +145,146 @@ async def test_distributed_direct_process_vllm_feature_flagged_worker_passes_fil
 
 
 @pytest.mark.asyncio
-async def test_distributed_direct_process_non_vllm_rejected_before_launch_filter():
+@pytest.mark.parametrize(
+    ("backend", "worker_backends", "backend_version"),
+    [
+        pytest.param("vLLM", "vLLM", "0.13.0", id="vllm"),
+        pytest.param(BackendEnum.SGLANG, "SGLang", "0.4.0", id="sglang"),
+        pytest.param("MindIE", "MindIE", None, id="mindie"),
+    ],
+)
+async def test_distributed_direct_process_supported_backends_with_bootstrap_and_distributed_capabilities_pass_filter(
+    backend,
+    worker_backends,
+    backend_version,
+):
     model = create_model(
-        backend=BackendEnum.SGLANG,
+        backend=backend,
+        backend_version=backend_version,
         backend_parameters=["--tensor-parallel-size", "8"],
     )
     worker = linux_nvidia_4_4080_16gx4()
-    _enable_direct_process(worker, backends="SGLang")
+    _enable_direct_process(worker, backends=worker_backends)
+    _enable_bootstrap_ready_direct_process(worker, backends=worker_backends)
+    _enable_distributed_direct_process(worker, backends=worker_backends)
+
+    filtered_workers, messages = await BackendFrameworkFilter(model).filter([worker])
+
+    assert len(filtered_workers) == 1
+    assert filtered_workers[0].name == worker.name
+    assert len(messages) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend", "worker_backends", "backend_version", "bootstrap_backends_label"),
+    [
+        pytest.param("vLLM", "vLLM", "0.13.0", "SGLang", id="vllm"),
+        pytest.param(BackendEnum.SGLANG, "SGLang", "0.4.0", "vLLM", id="sglang"),
+        pytest.param("MindIE", "MindIE", None, "vLLM", id="mindie"),
+    ],
+)
+async def test_distributed_direct_process_supported_backends_without_bootstrap_ready_capability_rejected(
+    backend,
+    worker_backends,
+    backend_version,
+    bootstrap_backends_label,
+):
+    model = create_model(
+        backend=backend,
+        backend_version=backend_version,
+        backend_parameters=["--tensor-parallel-size", "8"],
+    )
+    worker = linux_nvidia_4_4080_16gx4()
+    _enable_direct_process(worker, backends=worker_backends)
+    _enable_bootstrap_ready_direct_process(worker, backends=bootstrap_backends_label)
+    _enable_distributed_direct_process(worker, backends=worker_backends)
 
     filtered_workers, messages = await BackendFrameworkFilter(model).filter([worker])
 
     assert len(filtered_workers) == 0
     assert len(messages) == 1
-    assert "distributed launches only for the vLLM backend" in messages[0]
+    assert "bootstrap" in messages[0].lower()
+    assert worker.name in messages[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "backend",
+        "worker_backends",
+        "backend_version",
+        "distributed_backends_label",
+    ),
+    [
+        pytest.param("vLLM", "vLLM", "0.13.0", "SGLang", id="vllm"),
+        pytest.param(BackendEnum.SGLANG, "SGLang", "0.4.0", "vLLM", id="sglang"),
+        pytest.param("MindIE", "MindIE", None, "vLLM", id="mindie"),
+    ],
+)
+async def test_distributed_direct_process_supported_backends_without_distributed_capability_rejected(
+    backend,
+    worker_backends,
+    backend_version,
+    distributed_backends_label,
+):
+    model = create_model(
+        backend=backend,
+        backend_version=backend_version,
+        backend_parameters=["--tensor-parallel-size", "8"],
+    )
+    worker = linux_nvidia_4_4080_16gx4()
+    _enable_direct_process(worker, backends=worker_backends)
+    _enable_bootstrap_ready_direct_process(worker, backends=worker_backends)
+    _enable_distributed_direct_process(worker, backends=distributed_backends_label)
+
+    filtered_workers, messages = await BackendFrameworkFilter(model).filter([worker])
+
+    assert len(filtered_workers) == 0
+    assert len(messages) == 1
+    assert "distributed" in messages[0].lower()
+    assert worker.name in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_distributed_direct_process_unsupported_backend_rejected_before_launch_filter():
+    model = create_model(
+        backend="VoxBox",
+        distributed_inference_across_workers=True,
+        backend_parameters=["--tensor-parallel-size", "8"],
+    )
+    worker = linux_nvidia_4_4080_16gx4()
+    _enable_direct_process(worker, backends="vLLM")
+    _enable_bootstrap_ready_direct_process(worker, backends="vLLM")
+    _enable_distributed_direct_process(worker, backends="vLLM")
+
+    filtered_workers, messages = await BackendFrameworkFilter(model).filter([worker])
+
+    assert len(filtered_workers) == 0
+    assert len(messages) == 1
+    assert "supports only the vLLM backend" in messages[0]
+    assert "VoxBox" in messages[0]
+    assert worker.name in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_distributed_direct_process_vllm_without_bootstrap_ready_capability_rejected():
+    model = create_model(
+        backend="vLLM",
+        backend_version="0.13.0",
+        backend_parameters=["--tensor-parallel-size", "8"],
+    )
+    worker = linux_nvidia_4_4080_16gx4()
+    _enable_direct_process(worker, backends="vLLM")
+    _enable_bootstrap_ready_direct_process(worker, backends="SGLang")
+    _enable_distributed_direct_process(worker)
+
+    filtered_workers, messages = await BackendFrameworkFilter(model).filter([worker])
+
+    assert len(filtered_workers) == 0
+    assert len(messages) == 1
+    assert "bootstrap" in messages[0].lower()
+    assert worker.name in messages[0]
 
 
 @pytest.mark.asyncio

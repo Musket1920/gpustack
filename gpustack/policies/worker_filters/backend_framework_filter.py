@@ -1,9 +1,6 @@
 import logging
 from typing import Any, List, Tuple, Optional
 
-from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
-    VLLMResourceFitSelector,
-)
 from gpustack.policies.base import WorkerFilter
 from gpustack.schemas.models import Model, get_backend, BackendEnum
 from gpustack.schemas.workers import Worker, DirectProcessCapabilities
@@ -26,10 +23,13 @@ DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_MESSAGE = (
     "Direct process mode supports only single-worker launches; distributed workers are not supported."
 )
 DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_BACKEND_MESSAGE = (
-    "Direct process mode supports distributed launches only for the vLLM backend."
+    "Direct process mode supports distributed launches only for backends that advertise distributed direct-process capability."
 )
-DIRECT_PROCESS_MODE_DISTRIBUTED_VLLM_DISABLED_MESSAGE = (
-    "Distributed vLLM direct process mode is disabled on this worker."
+DIRECT_PROCESS_MODE_DISTRIBUTED_BOOTSTRAP_UNREADY_MESSAGE = (
+    "Distributed direct process mode is not bootstrap-ready on this worker for the requested backend."
+)
+DIRECT_PROCESS_MODE_DISTRIBUTED_DISABLED_MESSAGE = (
+    "Distributed direct process mode is disabled on this worker for the requested backend."
 )
 DIRECT_PROCESS_MODE_LABEL = "gpustack.direct-process-mode"
 
@@ -69,6 +69,44 @@ class BackendFrameworkFilter(WorkerFilter):
             return 0
         return len(worker.status.gpu_devices)
 
+    def _get_requested_direct_process_world_size(self) -> Optional[int]:
+        from gpustack.policies.candidate_selectors.ascend_mindie_resource_fit_selector import (
+            AscendMindIEResourceFitSelector,
+        )
+        from gpustack.policies.candidate_selectors.sglang_resource_fit_selector import (
+            SGLangResourceFitSelector,
+        )
+        from gpustack.policies.candidate_selectors.vllm_resource_fit_selector import (
+            VLLMResourceFitSelector,
+        )
+
+        def _parse_world_size(selector_cls) -> Optional[int]:
+            requested_world_size, _ = (
+                selector_cls.get_world_size_from_backend_parameters(self.model)
+            )
+            return requested_world_size
+
+        if self.backend_name == BackendEnum.VLLM:
+            return _parse_world_size(VLLMResourceFitSelector)
+
+        if self.backend_name == BackendEnum.ASCEND_MINDIE:
+            return _parse_world_size(AscendMindIEResourceFitSelector)
+
+        backend_name = str(self.backend_name).lower()
+        if backend_name == "sglang":
+            return _parse_world_size(SGLangResourceFitSelector)
+
+        for selector_cls in (
+            VLLMResourceFitSelector,
+            SGLangResourceFitSelector,
+            AscendMindIEResourceFitSelector,
+        ):
+            requested_world_size = _parse_world_size(selector_cls)
+            if requested_world_size:
+                return requested_world_size
+
+        return None
+
     def _get_direct_process_incompatible_reason(
         self, worker: Worker
     ) -> Optional[str]:
@@ -90,14 +128,14 @@ class BackendFrameworkFilter(WorkerFilter):
         if self._get_worker_platform_name(worker) != "linux":
             return DIRECT_PROCESS_MODE_UNSUPPORTED_PLATFORM_MESSAGE
 
-        requested_world_size, _ = (
-            VLLMResourceFitSelector.get_world_size_from_backend_parameters(self.model)
-        )
+        requested_world_size = self._get_requested_direct_process_world_size()
         if requested_world_size and self._get_worker_gpu_count(worker) < requested_world_size:
-            if self.backend_name != BackendEnum.VLLM:
-                return DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_BACKEND_MESSAGE
+            if not caps.supports_bootstrap_backend(self.backend_name):
+                return DIRECT_PROCESS_MODE_DISTRIBUTED_BOOTSTRAP_UNREADY_MESSAGE
             if not caps.supports_distributed_backend(self.backend_name):
-                return DIRECT_PROCESS_MODE_DISTRIBUTED_VLLM_DISABLED_MESSAGE
+                if self.backend_name != BackendEnum.VLLM:
+                    return DIRECT_PROCESS_MODE_UNSUPPORTED_DISTRIBUTED_BACKEND_MESSAGE
+                return DIRECT_PROCESS_MODE_DISTRIBUTED_DISABLED_MESSAGE
 
         return None
 
