@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from enum import Enum
 from typing import ClassVar, Dict, Optional, Any
-from pydantic import ConfigDict, BaseModel
+from pydantic import ConfigDict, BaseModel, PrivateAttr, model_validator
 from sqlmodel import (
     Field,
     SQLModel,
@@ -12,6 +12,7 @@ from sqlmodel import (
     Integer,
     ForeignKey,
 )
+import sqlalchemy as sa
 from sqlalchemy import String
 from gpustack.schemas.common import (
     ListParams,
@@ -184,6 +185,57 @@ class RPCServer(BaseModel):
     gpu_index: Optional[int] = None
 
 
+class WorkerControlChannelEnum(str, Enum):
+    OUTBOUND_CONTROL_WS = "outbound_control_ws"
+    REVERSE_HTTP = "reverse_http"
+
+
+class WorkerReachabilityModeEnum(str, Enum):
+    REVERSE_PROBE = "reverse_probe"
+    OUTBOUND_CONTROL_WS = WorkerControlChannelEnum.OUTBOUND_CONTROL_WS.value
+    REVERSE_HTTP = WorkerControlChannelEnum.REVERSE_HTTP.value
+
+
+class WorkerReachabilityCapabilities(BaseModel):
+    outbound_control_ws: bool = False
+    reverse_http: bool = False
+
+    def supports_mode(self, mode: WorkerReachabilityModeEnum) -> bool:
+        if mode == WorkerReachabilityModeEnum.REVERSE_PROBE:
+            return True
+        if mode == WorkerReachabilityModeEnum.OUTBOUND_CONTROL_WS:
+            return self.outbound_control_ws
+        if mode == WorkerReachabilityModeEnum.REVERSE_HTTP:
+            return self.reverse_http
+        return False
+
+    @property
+    def has_outbound_control(self) -> bool:
+        return self.outbound_control_ws or self.reverse_http
+
+
+def _resolve_default_reachability_mode(
+    capabilities: Optional[WorkerReachabilityCapabilities],
+) -> WorkerReachabilityModeEnum:
+    if not capabilities or not capabilities.has_outbound_control:
+        return WorkerReachabilityModeEnum.REVERSE_PROBE
+
+    configured_mode = getattr(
+        envs,
+        "WORKER_DEFAULT_REACHABILITY_MODE",
+        WorkerReachabilityModeEnum.REVERSE_PROBE.value,
+    )
+    try:
+        requested_mode = WorkerReachabilityModeEnum(configured_mode)
+    except ValueError:
+        requested_mode = WorkerReachabilityModeEnum.REVERSE_PROBE
+
+    if capabilities.supports_mode(requested_mode):
+        return requested_mode
+
+    return WorkerReachabilityModeEnum.REVERSE_PROBE
+
+
 class WorkerStateEnum(str, Enum):
     r"""
     Enum for Worker State
@@ -231,6 +283,46 @@ class WorkerStateEnum(str, Enum):
         ]
 
 
+class WorkerTransportHealthEnum(str, Enum):
+    UNSUPPORTED = "unsupported"
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+
+
+class WorkerControlPlaneHealthEnum(str, Enum):
+    UNSUPPORTED = "unsupported"
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
+class WorkerRuntimeHealthEnum(str, Enum):
+    NOT_READY = WorkerStateEnum.NOT_READY.value
+    READY = WorkerStateEnum.READY.value
+    PENDING = WorkerStateEnum.PENDING.value
+    PROVISIONING = WorkerStateEnum.PROVISIONING.value
+    INITIALIZING = WorkerStateEnum.INITIALIZING.value
+    DELETING = WorkerStateEnum.DELETING.value
+    ERROR = WorkerStateEnum.ERROR.value
+    MAINTENANCE = WorkerStateEnum.MAINTENANCE.value
+
+
+class WorkerReachabilityHealthEnum(str, Enum):
+    NOT_APPLICABLE = "not_applicable"
+    REACHABLE = "reachable"
+    UNREACHABLE = "unreachable"
+
+
+class WorkerHealth(BaseModel):
+    transport: WorkerTransportHealthEnum = WorkerTransportHealthEnum.UNSUPPORTED
+    control_plane: WorkerControlPlaneHealthEnum = (
+        WorkerControlPlaneHealthEnum.UNSUPPORTED
+    )
+    runtime: WorkerRuntimeHealthEnum = WorkerRuntimeHealthEnum.NOT_READY
+    reachability: WorkerReachabilityHealthEnum = (
+        WorkerReachabilityHealthEnum.NOT_APPLICABLE
+    )
+
+
 class SystemInfo(BaseModel):
     cpu: Optional[CPUInfo] = Field(sa_column=Column(JSON), default=None)
     memory: Optional[MemoryInfo] = Field(sa_column=Column(JSON), default=None)
@@ -275,12 +367,19 @@ class WorkerStatus(SystemInfo):
 
 
 class WorkerStatusStored(BaseModel):
+    _reachability_mode_inferred: bool = PrivateAttr(default=False)
+
     advertise_address: Optional[str] = None
     hostname: str
     ip: str
     ifname: str
     port: int
     metrics_port: Optional[int] = None
+    capabilities: Optional[WorkerReachabilityCapabilities] = Field(
+        default=None,
+        sa_column=Column(pydantic_column_type(WorkerReachabilityCapabilities)),
+    )
+    reachability_mode: Optional[WorkerReachabilityModeEnum] = Field(default=None)
 
     system_reserved: Optional[SystemReserved] = Field(
         default=None, sa_column=Column(pydantic_column_type(SystemReserved))
@@ -300,6 +399,27 @@ class WorkerStatusStored(BaseModel):
     proxy_mode: Optional[ModelInstanceProxyModeEnum] = Field(
         default=ModelInstanceProxyModeEnum.WORKER,
     )
+
+    @model_validator(mode="after")
+    def validate_reachability_mode(self):
+        capabilities = self.capabilities or WorkerReachabilityCapabilities()
+
+        if self.reachability_mode is None:
+            vars(self)["reachability_mode"] = _resolve_default_reachability_mode(
+                capabilities
+            )
+            object.__setattr__(self, "_reachability_mode_inferred", True)
+
+        reachability_mode = self.reachability_mode
+        if reachability_mode is None:
+            raise ValueError("reachability_mode could not be resolved")
+
+        if not capabilities.supports_mode(reachability_mode):
+            raise ValueError(
+                f"reachability_mode '{reachability_mode.value}' requires explicit worker capability advertisement"
+            )
+
+        return self
 
 
 class WorkerStatusPublic(WorkerStatusStored):
@@ -328,23 +448,117 @@ class WorkerCreate(WorkerStatusStored, WorkerUpdate):
         default=None, sa_column=Column(String(255), nullable=True)
     )
 
+    def model_dump(self, *args, **kwargs):
+        data = super().model_dump(*args, **kwargs)
+        if self.capabilities is None:
+            data.pop("capabilities", None)
+        if self._reachability_mode_inferred:
+            data.pop("reachability_mode", None)
+        return data
+
 
 class WorkerBase(WorkerCreate):
+    _active_control_session: Optional["WorkerSession"] = PrivateAttr(default=None)
+
     state: WorkerStateEnum = WorkerStateEnum.NOT_READY
     heartbeat_time: Optional[datetime] = Field(
         sa_column=Column(UTCDateTime), default=None
     )
     unreachable: bool = False
 
-    def compute_state(self):
+    def set_active_control_session(
+        self,
+        worker_session: Optional["WorkerSession"],
+    ) -> None:
+        self._active_control_session = worker_session
+
+    def uses_legacy_unreachable_instance_coupling(self) -> bool:
+        return self.reachability_mode == WorkerReachabilityModeEnum.REVERSE_PROBE
+
+    def should_block_new_placements(self) -> bool:
+        if self.state != WorkerStateEnum.READY:
+            return True
+
+        if self.reachability_mode != WorkerReachabilityModeEnum.OUTBOUND_CONTROL_WS:
+            return False
+
+        health = self.health_status
+        return (
+            health.transport != WorkerTransportHealthEnum.CONNECTED
+            or health.control_plane != WorkerControlPlaneHealthEnum.AVAILABLE
+            or health.runtime != WorkerRuntimeHealthEnum.READY
+        )
+
+    def _compute_runtime_health(self) -> WorkerRuntimeHealthEnum:
         if self.maintenance and self.maintenance.enabled:
+            return WorkerRuntimeHealthEnum.MAINTENANCE
+
+        if self.state.is_provisioning:
+            return WorkerRuntimeHealthEnum(self.state.value)
+
+        if self.state == WorkerStateEnum.NOT_READY and self.state_message is not None:
+            return WorkerRuntimeHealthEnum.NOT_READY
+
+        is_not_ready_flag, _ = is_offline(
+            self.heartbeat_time,
+            envs.WORKER_HEARTBEAT_GRACE_PERIOD,
+            datetime.now(timezone.utc),
+        )
+        if is_not_ready_flag:
+            return WorkerRuntimeHealthEnum.NOT_READY
+
+        return WorkerRuntimeHealthEnum.READY
+
+    def _compute_reachability_health(self) -> WorkerReachabilityHealthEnum:
+        if self.reachability_mode != WorkerReachabilityModeEnum.REVERSE_PROBE:
+            return WorkerReachabilityHealthEnum.NOT_APPLICABLE
+
+        if self.unreachable:
+            return WorkerReachabilityHealthEnum.UNREACHABLE
+
+        return WorkerReachabilityHealthEnum.REACHABLE
+
+    def _compute_transport_health(self) -> WorkerTransportHealthEnum:
+        if self.reachability_mode != WorkerReachabilityModeEnum.OUTBOUND_CONTROL_WS:
+            return WorkerTransportHealthEnum.UNSUPPORTED
+
+        if self._active_control_session is not None:
+            return WorkerTransportHealthEnum.CONNECTED
+
+        return WorkerTransportHealthEnum.DISCONNECTED
+
+    def _compute_control_plane_health(self) -> WorkerControlPlaneHealthEnum:
+        if self.reachability_mode not in {
+            WorkerReachabilityModeEnum.OUTBOUND_CONTROL_WS,
+            WorkerReachabilityModeEnum.REVERSE_HTTP,
+        }:
+            return WorkerControlPlaneHealthEnum.UNSUPPORTED
+
+        if self._active_control_session is not None:
+            return WorkerControlPlaneHealthEnum.AVAILABLE
+
+        return WorkerControlPlaneHealthEnum.UNAVAILABLE
+
+    @property
+    def health_status(self) -> WorkerHealth:
+        return WorkerHealth(
+            transport=self._compute_transport_health(),
+            control_plane=self._compute_control_plane_health(),
+            runtime=self._compute_runtime_health(),
+            reachability=self._compute_reachability_health(),
+        )
+
+    def compute_state(self):
+        runtime_health = self._compute_runtime_health()
+
+        if runtime_health == WorkerRuntimeHealthEnum.MAINTENANCE:
             self.state = WorkerStateEnum.MAINTENANCE
-            self.state_message = self.maintenance.message
+            self.state_message = self.maintenance.message if self.maintenance else None
             return
 
         if self.state.is_provisioning:
             return
-        if self.state == WorkerStateEnum.NOT_READY and self.state_message is not None:
+        if runtime_health == WorkerRuntimeHealthEnum.NOT_READY and self.state == WorkerStateEnum.NOT_READY and self.state_message is not None:
             return
 
         is_not_ready_flag, last_heartbeat_str = is_offline(
@@ -365,7 +579,7 @@ class WorkerBase(WorkerCreate):
             )
             return
 
-        if self.unreachable:
+        if self._compute_reachability_health() == WorkerReachabilityHealthEnum.UNREACHABLE:
             address = self.advertise_address or self.ip
             healthz_url = f"http://{address}:{self.port}/healthz"
             msg = (
@@ -405,6 +619,14 @@ class Worker(WorkerBase, BaseModelMixin, table=True):
     )
     worker_pool: Optional[WorkerPool] = Relationship(
         back_populates="pool_workers", sa_relationship_kwargs={"lazy": "noload"}
+    )
+    worker_sessions: List["WorkerSession"] = Relationship(
+        back_populates="worker",
+        sa_relationship_kwargs={"lazy": "noload", "cascade": "delete"},
+    )
+    worker_commands: List["WorkerCommand"] = Relationship(
+        back_populates="worker",
+        sa_relationship_kwargs={"lazy": "noload", "cascade": "delete"},
     )
 
     # This field should be replaced by x509 credential if mTLS is supported.
@@ -468,6 +690,9 @@ class WorkerPublic(
     id: int
     created_at: datetime
     updated_at: datetime
+    health: WorkerHealth = Field(default_factory=WorkerHealth)
+    reverse_http_available: bool = True
+    reverse_http_unavailable_message: Optional[str] = None
     me: Optional[bool] = None  # Indicates if the worker is the current worker
     provision_progress: Optional[str] = None  # Indicates the provisioning progress
 
@@ -480,6 +705,234 @@ class WorkerRegistrationPublic(WorkerPublic):
 
 
 WorkersPublic = PaginatedList[WorkerPublic]
+
+
+class WorkerControlMessageTypeEnum(str, Enum):
+    HELLO = "hello"
+    COMMAND = "command"
+    COMMAND_ACK = "command_ack"
+    COMMAND_RESULT = "command_result"
+    PING = "ping"
+    PONG = "pong"
+    ERROR = "error"
+
+
+class WorkerControlCommandStateEnum(str, Enum):
+    PENDING = "pending"
+    LEASED = "leased"
+    SENT = "sent"
+    ACKNOWLEDGED = "acknowledged"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+    TIMED_OUT = "timed_out"
+    SUPERSEDED = "superseded"
+
+
+class WorkerSessionStateEnum(str, Enum):
+    ACTIVE = "active"
+    STALE = "stale"
+    CLOSED = "closed"
+    EXPIRED = "expired"
+
+
+class WorkerControlMessageBase(BaseModel):
+    message_type: WorkerControlMessageTypeEnum
+    session_id: Optional[str] = None
+    protocol_version: int = 1
+    sent_at: Optional[datetime] = None
+
+
+class WorkerHelloMessage(WorkerControlMessageBase):
+    message_type: WorkerControlMessageTypeEnum = WorkerControlMessageTypeEnum.HELLO
+    worker_uuid: str
+    capabilities: WorkerReachabilityCapabilities = Field(
+        default_factory=WorkerReachabilityCapabilities
+    )
+    reachability_mode: Optional[WorkerReachabilityModeEnum] = None
+
+    @model_validator(mode="after")
+    def validate_hello_reachability_mode(self):
+        if self.reachability_mode is None:
+            self.reachability_mode = _resolve_default_reachability_mode(
+                self.capabilities
+            )
+
+        if not self.capabilities.supports_mode(self.reachability_mode):
+            raise ValueError(
+                f"reachability_mode '{self.reachability_mode.value}' requires explicit worker capability advertisement"
+            )
+
+        return self
+
+
+class WorkerCommandMessage(WorkerControlMessageBase):
+    message_type: WorkerControlMessageTypeEnum = WorkerControlMessageTypeEnum.COMMAND
+    command_id: str
+    command_type: str
+    payload: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    desired_worker_state_revision: Optional[int] = None
+
+
+class WorkerCommandAckMessage(WorkerControlMessageBase):
+    message_type: WorkerControlMessageTypeEnum = (
+        WorkerControlMessageTypeEnum.COMMAND_ACK
+    )
+    command_id: str
+    accepted: bool = True
+    state: WorkerControlCommandStateEnum = WorkerControlCommandStateEnum.ACKNOWLEDGED
+    error_message: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_ack_message(self):
+        if not self.accepted and not self.error_message:
+            raise ValueError("error_message is required when a command is rejected")
+        return self
+
+
+class WorkerCommandResultMessage(WorkerControlMessageBase):
+    message_type: WorkerControlMessageTypeEnum = (
+        WorkerControlMessageTypeEnum.COMMAND_RESULT
+    )
+    command_id: str
+    state: WorkerControlCommandStateEnum
+    result: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
+    error_message: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_result_message(self):
+        failure_states = {
+            WorkerControlCommandStateEnum.FAILED,
+            WorkerControlCommandStateEnum.CANCELLED,
+            WorkerControlCommandStateEnum.EXPIRED,
+        }
+        if self.state in failure_states and not self.error_message:
+            raise ValueError(
+                "error_message is required for failed, cancelled, or expired command results"
+            )
+        return self
+
+
+class WorkerPingMessage(WorkerControlMessageBase):
+    message_type: WorkerControlMessageTypeEnum = WorkerControlMessageTypeEnum.PING
+
+
+class WorkerPongMessage(WorkerControlMessageBase):
+    message_type: WorkerControlMessageTypeEnum = WorkerControlMessageTypeEnum.PONG
+
+
+class WorkerErrorMessage(WorkerControlMessageBase):
+    message_type: WorkerControlMessageTypeEnum = WorkerControlMessageTypeEnum.ERROR
+    error_code: str
+    error_message: str
+
+
+class WorkerSessionBase(SQLModel):
+    session_id: str = Field(index=True, unique=True)
+    worker_id: int = Field(default=None, foreign_key="workers.id")
+    generation: int = Field(default=1)
+    control_channel: WorkerControlChannelEnum
+    reachability_mode: WorkerReachabilityModeEnum
+    state: WorkerSessionStateEnum = WorkerSessionStateEnum.ACTIVE
+    protocol_version: int = Field(default=1)
+    connected_at: Optional[datetime] = Field(sa_column=Column(UTCDateTime), default=None)
+    last_seen_at: Optional[datetime] = Field(sa_column=Column(UTCDateTime), default=None)
+    disconnected_at: Optional[datetime] = Field(
+        sa_column=Column(UTCDateTime), default=None
+    )
+    expires_at: Optional[datetime] = Field(sa_column=Column(UTCDateTime), default=None)
+    last_command_sequence: int = Field(default=0)
+    last_acknowledged_command_sequence: int = Field(default=0)
+    last_completed_command_sequence: int = Field(default=0)
+    replay_cursor: int = Field(default=0)
+    requires_full_reconcile: bool = Field(default=False)
+    full_reconcile_reason: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    details: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
+
+
+class WorkerSession(WorkerSessionBase, BaseModelMixin, table=True):
+    __tablename__ = 'worker_sessions'  # type: ignore
+    __table_args__ = (
+        sa.Index("ix_worker_sessions_worker_id_generation", "worker_id", "generation"),
+        sa.UniqueConstraint(
+            "worker_id",
+            "generation",
+            name="uq_worker_sessions_worker_id_generation",
+        ),
+    )
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    worker: Worker = Relationship(
+        back_populates="worker_sessions",
+        sa_relationship_kwargs={"lazy": "noload"},
+    )
+    worker_commands: List["WorkerCommand"] = Relationship(
+        back_populates="worker_session",
+        sa_relationship_kwargs={"lazy": "noload"},
+    )
+
+
+class WorkerCommandBase(SQLModel):
+    command_id: str = Field(index=True, unique=True)
+    worker_id: int = Field(default=None, foreign_key="workers.id")
+    sequence: int = Field(default=0)
+    worker_session_id: Optional[int] = Field(
+        default=None, foreign_key="worker_sessions.id"
+    )
+    worker_session_generation: Optional[int] = None
+    command_type: str
+    payload: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    state: WorkerControlCommandStateEnum = WorkerControlCommandStateEnum.PENDING
+    idempotency_key: Optional[str] = None
+    dispatch_attempts: int = Field(default=0)
+    desired_worker_state_revision: Optional[int] = None
+    lease_expires_at: Optional[datetime] = Field(
+        sa_column=Column(UTCDateTime), default=None
+    )
+    not_before: Optional[datetime] = Field(sa_column=Column(UTCDateTime), default=None)
+    dispatched_at: Optional[datetime] = Field(
+        sa_column=Column(UTCDateTime), default=None
+    )
+    acknowledged_at: Optional[datetime] = Field(
+        sa_column=Column(UTCDateTime), default=None
+    )
+    completed_at: Optional[datetime] = Field(sa_column=Column(UTCDateTime), default=None)
+    expires_at: Optional[datetime] = Field(sa_column=Column(UTCDateTime), default=None)
+    result: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
+    error_message: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
+
+class WorkerCommand(WorkerCommandBase, BaseModelMixin, table=True):
+    __tablename__ = 'worker_commands'  # type: ignore
+    __table_args__ = (
+        sa.Index("ix_worker_commands_worker_id_sequence", "worker_id", "sequence"),
+        sa.Index(
+            "ix_worker_commands_worker_id_idempotency_key",
+            "worker_id",
+            "idempotency_key",
+            unique=True,
+        ),
+        sa.UniqueConstraint(
+            "worker_id",
+            "sequence",
+            name="uq_worker_commands_worker_id_sequence",
+        ),
+    )
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    worker: Worker = Relationship(
+        back_populates="worker_commands",
+        sa_relationship_kwargs={"lazy": "noload"},
+    )
+    worker_session: Optional[WorkerSession] = Relationship(
+        back_populates="worker_commands",
+        sa_relationship_kwargs={"lazy": "noload"},
+    )
 
 
 # ---------------------------------------------------------------------------
