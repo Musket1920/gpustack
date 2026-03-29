@@ -166,6 +166,28 @@ Open your browser and navigate to `http://your_host_ip` to access the GPUStack U
 
 7. After the worker node connects successfully, it will appear on the `Workers` page in the GPUStack UI.
 
+### Outbound worker control rollout
+
+This rollout is scoped to a single GPUStack server. It does not add HA routing, shared websocket session state, or cross-server failover.
+
+Use `GPUSTACK_WORKER_CONTROL_ROLLOUT_MODE` on the worker to choose one of three rollout paths:
+
+- `legacy_only` disables outbound websocket control and keeps the legacy reverse-probe path.
+- `hybrid` allows outbound websocket control sessions, but keeps `reverse_probe` as the default reachability mode for websocket-capable workers.
+- `ws_preferred` keeps the same registration and status flow, but changes the default reachability mode for websocket-capable workers to `outbound_control_ws`.
+
+Rollback is a worker config change, not a migration. Set `GPUSTACK_WORKER_CONTROL_ROLLOUT_MODE=legacy_only`, restart the worker, and it returns to the legacy reverse-probe path.
+
+`GPUSTACK_WORKER_DEFAULT_REACHABILITY_MODE` still works as a compatibility override, but new rollouts should prefer `GPUSTACK_WORKER_CONTROL_ROLLOUT_MODE`.
+
+Use `GPUSTACK_WORKER_REVERSE_HTTP_ENABLED=false` on websocket-capable NAT workers that cannot serve server-initiated reverse HTTP routes. Leave it at the default `true` for websocket workers that still expose those reverse HTTP paths.
+
+Reverse-only NAT limits still apply. A websocket-only worker can receive outbound control commands, but server-initiated reverse HTTP operations such as worker filesystem checks, worker log fetches, and OpenAI reverse proxy hops still need reverse HTTP reachability. Those operations remain unsupported for reverse-only NAT workers.
+
+Distributed runtime behavior also stays fail closed. If peer workers still need direct reachability and that reachability is missing, GPUStack must reject the placement instead of treating websocket control as a substitute for runtime data-plane connectivity.
+
+For timeout tuning, adjust `GPUSTACK_WORKER_CONTROL_WS_HEARTBEAT_TIMEOUT_SECONDS` and `GPUSTACK_WORKER_CONTROL_SESSION_LOSS_TIMEOUT_SECONDS` together. Keep the session-loss timeout at or above the heartbeat timeout, then raise both only enough to avoid false stale-session transitions on slower links.
+
 Fork-only direct-process workflow for a worker that is already running in a Linux container:
 
 1. Start the worker with `GPUSTACK_DIRECT_PROCESS_MODE=true` in its environment.

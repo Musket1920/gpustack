@@ -78,6 +78,26 @@ sudo docker run -d --name gpustack-worker \
 
 7. After the worker node connects successfully, it will appear on the `Workers` page in the GPUStack UI.
 
+## Outbound Worker Control Rollout
+
+This rollout is for a single GPUStack server. It does not add HA routing, shared websocket session state, or cross-server failover.
+
+Use these worker-side rollout modes during migration:
+
+- `GPUSTACK_WORKER_CONTROL_ROLLOUT_MODE=legacy_only` keeps the legacy reverse-probe path and disables outbound websocket control on that worker.
+- `GPUSTACK_WORKER_CONTROL_ROLLOUT_MODE=hybrid` allows outbound websocket control sessions, but keeps `reverse_probe` as the default reachability mode for websocket-capable workers.
+- `GPUSTACK_WORKER_CONTROL_ROLLOUT_MODE=ws_preferred` keeps the same registration and status flow, but changes the default reachability mode for websocket-capable workers to `outbound_control_ws`.
+
+Rollback is a config-only change. Set `GPUSTACK_WORKER_CONTROL_ROLLOUT_MODE=legacy_only` on the worker, restart it, and the worker returns to the legacy reverse-probe path.
+
+Keep `GPUSTACK_WORKER_DEFAULT_REACHABILITY_MODE` only for compatibility with older configuration. New rollouts should prefer `GPUSTACK_WORKER_CONTROL_ROLLOUT_MODE`.
+
+Reverse-only NAT limitations still apply. A websocket-only worker can receive outbound control commands, but server-initiated reverse HTTP operations such as worker filesystem checks, worker log fetches, and OpenAI reverse proxy hops still need reverse HTTP reachability. GPUStack reports those operations as unsupported instead of silently retrying over the websocket control channel.
+
+Distributed runtime placement also stays fail closed. If a distributed backend still needs peer to peer worker reachability and the workers cannot reach each other, GPUStack must reject the placement. The outbound websocket control channel does not replace runtime data-plane connectivity between workers.
+
+For higher-latency links, tune `GPUSTACK_WORKER_CONTROL_WS_HEARTBEAT_TIMEOUT_SECONDS` and `GPUSTACK_WORKER_CONTROL_SESSION_LOSS_TIMEOUT_SECONDS` together. Start by increasing both values, keep the session-loss timeout at or above the heartbeat timeout, and use the smallest values that stop false stale-session transitions.
+
 ## Deploy a Model
 
 1. Navigate to the `Catalog` page in the GPUStack UI.

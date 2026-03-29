@@ -104,6 +104,12 @@ The **Applies to** column indicates where the environment variable should be set
 | `GPUSTACK_WORKER_HEARTBEAT_INTERVAL`                             | Worker heartbeat interval in seconds.                                                                                | `30`    | Worker     |
 | `GPUSTACK_WORKER_STATUS_SYNC_INTERVAL`                           | Worker status synchronization interval in seconds.                                                                   | `30`    | Worker     |
 | `GPUSTACK_WORKER_UNREACHABLE_CHECK_MODE`                         | Worker unreachable check mode. Options: `auto`, `enabled`, `disabled`. `auto` disables check when worker count > 50. | `auto`  | Server     |
+| `GPUSTACK_WORKER_CONTROL_ROLLOUT_MODE`                          | Worker control rollout mode. `legacy_only` disables outbound websocket control, `hybrid` keeps reverse probe as the default reachability path while allowing outbound websocket sessions, and `ws_preferred` makes outbound websocket control the default for websocket-capable workers. | `hybrid` | Worker |
+| `GPUSTACK_WORKER_DEFAULT_REACHABILITY_MODE`                     | Compatibility override for the default reachability mode of outbound-capable workers. Use `reverse_probe` to keep legacy reachability, or `outbound_control_ws` to prefer websocket control. `GPUSTACK_WORKER_CONTROL_ROLLOUT_MODE` is the recommended operator knob. | rollout-dependent | Worker |
+| `GPUSTACK_WORKER_CONTROL_WS_HEARTBEAT_TIMEOUT_SECONDS`          | Websocket heartbeat timeout in seconds for an active outbound control session. Increase this for slower links before widening the session-loss timeout. | `45`    | Server     |
+| `GPUSTACK_WORKER_CONTROL_SESSION_LOSS_TIMEOUT_SECONDS`          | How long the server waits before treating an outbound control session as stale and blocking new scheduling on that worker. | same as heartbeat timeout | Server |
+| `GPUSTACK_WORKER_CONTROL_SESSION_TTL_SECONDS`                   | Durable worker control session TTL in seconds. Controls how long inactive session records remain reusable for replay and reconnect handling. | `300`   | Server     |
+| `GPUSTACK_WORKER_CONTROL_COMMAND_TTL_SECONDS`                   | Durable worker control command TTL in seconds. Commands that exceed this window expire instead of replaying forever. | `3600`  | Server     |
 | `GPUSTACK_WORKER_HEARTBEAT_GRACE_PERIOD`                         | Worker heartbeat grace period in seconds.                                                                            | `150`   | Server     |
 | `GPUSTACK_MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD`                | Model instance reschedule grace period in seconds.                                                                   | `300`   | Server     |
 | `GPUSTACK_MODEL_EVALUATION_CACHE_MAX_SIZE`                       | Maximum size of model evaluation cache.                                                                              | `1000`  | Server     |
@@ -113,6 +119,16 @@ The **Applies to** column indicates where the environment variable should be set
 | `GPUSTACK_WORKER_STATUS_COLLECTION_LOG_SLOW_SECONDS`             | Add debug log for slow worker status collection if it exceeds this time in seconds.                                  | `180`   | Worker     |
 | `GPUSTACK_MODEL_INSTANCE_HEALTH_CHECK_INTERVAL`                  | Model instance health check interval in seconds.                                                                     | `3`     | Worker     |
 | `GPUSTACK_DISABLE_OS_FILELOCK`                                   | Disable OS file lock.                                                                                                | `false` | Worker     |
+
+### Worker Control Rollout Notes
+
+- This rollout is single-server scoped. It does not add HA routing, shared websocket session state, or cross-server failover.
+- `legacy_only` is the rollback path. It disables outbound websocket control on the worker and keeps the worker on the legacy reverse-probe path.
+- `hybrid` is the staged rollout mode. Workers may establish outbound websocket sessions, but reverse probe remains the default reachability mode unless you explicitly override it.
+- `ws_preferred` keeps the same registration and status flows, but default reachability for websocket-capable workers changes to `outbound_control_ws`.
+- Reverse-only server to worker operations remain unsupported for websocket-only NAT workers. Filesystem checks, worker log fetches, and OpenAI reverse proxy hops still need a reverse HTTP path when the operation itself is server initiated.
+- Distributed runtime behavior stays fail closed. If peer workers still need direct reachability and that reachability is missing, GPUStack must reject the placement instead of pretending the websocket control channel solved peer data-path routing.
+- For timeout tuning, raise `GPUSTACK_WORKER_CONTROL_WS_HEARTBEAT_TIMEOUT_SECONDS` and `GPUSTACK_WORKER_CONTROL_SESSION_LOSS_TIMEOUT_SECONDS` together for higher-latency links. Keep the session-loss timeout at or above the heartbeat timeout so transient websocket jitter does not block new scheduling too aggressively.
 
 ### Benchmark Configuration
 

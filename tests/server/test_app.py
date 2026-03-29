@@ -39,3 +39,27 @@ def test_create_app_without_ui_assets(monkeypatch, config, tmp_path, caplog):
     assert "/" not in route_paths
     assert "skipping docs asset patching" in caplog.text
     assert "skipping UI route registration" in caplog.text
+
+
+def test_create_app_registers_worker_control_websocket_once(config):
+    app = create_app(config)
+
+    websocket_paths = [
+        getattr(route, "path", None)
+        for route in app.routes
+        if route.__class__.__name__ == "APIWebSocketRoute"
+    ]
+
+    assert websocket_paths.count("/v2/workers/control/ws") == 1
+
+
+def test_nat_worker_status_label():
+    worker_bundle = (
+        ui.get_ui_dir() / "js" / "p__resources__components__workers.1774403358321.chunk.js"
+    )
+    worker_bundle_text = worker_bundle.read_text(encoding="utf-8")
+
+    assert "Legacy reverse probe" in worker_bundle_text
+    assert "Reconnecting" in worker_bundle_text
+    assert "Degraded" in worker_bundle_text
+    assert "reverse_http_unavailable_message" in worker_bundle_text
