@@ -14,6 +14,8 @@ from gpustack.schemas.workers import (
     WorkerCreate,
     WorkerUpdate,
     WorkerRegistrationPublic,
+    WorkerReachabilityCapabilities,
+    WorkerReachabilityModeEnum,
 )
 from gpustack.schemas.config import PredefinedConfigNoDefaults
 from gpustack.security import API_KEY_PREFIX
@@ -51,6 +53,8 @@ class WorkerManager:
     _registration_client: Optional[WorkerRegistrationClient] = None
     _status_client: Optional[WorkerStatusClient] = None
     _bootstrap_manager: Optional[BootstrapManager] = None
+    _capabilities_getter: Callable[[], WorkerReachabilityCapabilities]
+    _reachability_mode_getter: Callable[[], WorkerReachabilityModeEnum]
 
     @property
     def _data_dir(self) -> str:
@@ -63,10 +67,14 @@ class WorkerManager:
         cfg: Config,
         is_embedded: bool,
         collector: "WorkerStatusCollector",
+        capabilities_getter: Callable[[], WorkerReachabilityCapabilities],
+        reachability_mode_getter: Callable[[], WorkerReachabilityModeEnum],
     ):
         self._is_embedded = is_embedded
         self._cfg = cfg
         self._collector = collector
+        self._capabilities_getter = capabilities_getter
+        self._reachability_mode_getter = reachability_mode_getter
         worker_token = read_worker_token(self._data_dir)
         if worker_token:
             self._prepare_clients(worker_token)
@@ -147,6 +155,8 @@ class WorkerManager:
                 **workerStatus.model_dump(),
                 **workerUpdate.model_dump(),
                 "external_id": external_id,
+                "capabilities": self._capabilities_getter().model_dump(),
+                "reachability_mode": self._reachability_mode_getter().value,
             }
         )
         created = self._registration_client.create(to_register)

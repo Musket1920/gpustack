@@ -2,7 +2,7 @@ import asyncio
 from collections import defaultdict
 from contextlib import asynccontextmanager
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, cast
 import json
 import os
 
@@ -51,6 +51,12 @@ from gpustack.worker.exporter import MetricExporter
 from gpustack.worker.tools_manager import ToolsManager
 from gpustack.worker.worker_manager import WorkerManager
 from gpustack.worker.collector import WorkerStatusCollector
+from gpustack.worker.control_client import (
+    WorkerControlClient,
+    worker_control_capabilities,
+    worker_control_reachability_mode,
+)
+from gpustack.worker.command_executor import WorkerCommandExecutor
 from gpustack.config.registration import read_worker_token
 from gpustack.config import registration
 from gpustack.gateway import init_async_k8s_config
@@ -62,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 
 class Worker:
-    _default_config: PredefinedConfigNoDefaults
+    _default_config: Optional[PredefinedConfigNoDefaults] = None
     _clientset: ClientSet
     _register_clientset: ClientSet
     _status_collector: WorkerStatusCollector
@@ -70,8 +76,11 @@ class Worker:
     _serve_manager: ServeManager
     _bootstrap_manager: BootstrapManager
     _benchmark_manager: BenchmarkManager
+    _model_file_manager: Optional[ModelFileManager] = None
     _workload_cleaner: WorkloadCleaner
     _config: Config
+    _worker_control_client: WorkerControlClient
+    _worker_command_executor: Optional[WorkerCommandExecutor] = None
     _worker_ip: Optional[str] = None
     _worker_ifname: Optional[str] = None
     _worker_id: Optional[int] = None
@@ -80,29 +89,45 @@ class Worker:
     _cluster_id: Optional[int] = None
 
     def worker_ip(self) -> str:
-        return self._config.worker_ip or self._worker_ip
+        worker_ip = self._config.worker_ip or self._worker_ip
+        assert worker_ip is not None
+        return worker_ip
 
     def worker_ifname(self) -> str:
-        return self._config.worker_ifname or self._worker_ifname
+        worker_ifname = self._config.worker_ifname or self._worker_ifname
+        assert worker_ifname is not None
+        return worker_ifname
 
-    def worker_name(self) -> Optional[str]:
-        return (
+    def worker_name(self) -> str:
+        name = (
             self._config.worker_name
             or self._worker_name
-            or get_worker_name(self._config.data_dir)
+            or get_worker_name(cast(str, self._config.data_dir))
         )
+        assert name is not None
+        return name
 
     def worker_uuid(self) -> str:
-        return self._worker_uuid or get_legacy_uuid(self._config.data_dir) or ""
+        worker_uuid = self._worker_uuid or get_legacy_uuid(cast(str, self._config.data_dir))
+        assert worker_uuid is not None
+        return worker_uuid
 
     def worker_id(self) -> int:
-        return self._worker_id
+        worker_id = self._worker_id
+        assert worker_id is not None
+        return worker_id
 
     def clientset(self) -> ClientSet:
         return self._clientset
 
     def cluster_id(self) -> Optional[int]:
         return self._cluster_id
+
+    def worker_reachability_capabilities(self):
+        return worker_control_capabilities()
+
+    def worker_reachability_mode(self):
+        return worker_control_reachability_mode()
 
     def __init__(self, cfg: Config):
         self._config = cfg
@@ -122,12 +147,24 @@ class Worker:
             worker_ifname_getter=self.worker_ifname,
             worker_id_getter=self.worker_id,
             worker_uuid_getter=self.worker_uuid,
+            capabilities_getter=self.worker_reachability_capabilities,
+            reachability_mode_getter=self.worker_reachability_mode,
         )
 
         self._worker_manager = WorkerManager(
             cfg=cfg,
             is_embedded=self._is_embedded,
             collector=self._status_collector,
+            capabilities_getter=self.worker_reachability_capabilities,
+            reachability_mode_getter=self.worker_reachability_mode,
+        )
+
+        self._worker_control_client = WorkerControlClient(
+            cfg=cfg,
+            worker_id_getter=self.worker_id,
+            worker_uuid_getter=self.worker_uuid,
+            capabilities_getter=self.worker_reachability_capabilities,
+            reachability_mode_getter=self.worker_reachability_mode,
         )
 
         self._exporter = MetricExporter(
@@ -165,13 +202,13 @@ class Worker:
         wait=tenacity.wait_fixed(3),
         reraise=True,
         before_sleep=lambda retry_state: logger.debug(
-            f"Retrying to get worker ID (attempt {retry_state.attempt_number}) due to: {retry_state.outcome.exception()}"
+            "Retrying to get worker ID (attempt %s) due to: %s",
+            retry_state.attempt_number,
+            retry_state.outcome.exception() if retry_state.outcome else "unknown error",
         ),
     )
     def _register(self):
-        self._clientset, self._default_config = (
-            self._worker_manager.register_with_server()
-        )
+        self._clientset, self._default_config = self._worker_manager.register_with_server()
         # Worker ID is available after the worker registration.
         worker_list = self._clientset.workers.list(
             params={"me": 'true'},
@@ -197,13 +234,13 @@ class Worker:
         init_async_k8s_config(cfg=self._config)
 
         tools_manager = ToolsManager(
-            tools_download_base_url=self._config.tools_download_base_url,
+            tools_download_base_url=cast(str, self._config.tools_download_base_url),
             pipx_path=self._config.pipx_path,
-            data_dir=self._config.data_dir,
+            data_dir=cast(str, self._config.data_dir),
             bin_dir=self._config.bin_dir,
         )
         tools_manager.prepare_tools()
-        catalog.prepare_chat_templates(self._config.data_dir)
+        catalog.prepare_chat_templates(cast(str, self._config.data_dir))
 
         try:
             asyncio.run(self.start_async())
@@ -243,9 +280,27 @@ class Worker:
         add_signal_handlers_in_loop()
 
         self._register()
-        self._config.reload_worker_config(self._default_config)
+        if self._default_config is not None:
+            self._config.reload_worker_config(self._default_config)
         self.log_worker_config()
         self._serve_manager.reconcile_stale_direct_process_registry()
+        self._model_file_manager = ModelFileManager(
+            worker_id=self.worker_id(), clientset=self._clientset, cfg=self._config
+        )
+        self._worker_command_executor = WorkerCommandExecutor(
+            clientset_getter=self.clientset,
+            serve_manager=self._serve_manager,
+            worker_manager=self._worker_manager,
+            model_file_manager=self._model_file_manager,
+            benchmark_manager=self._benchmark_manager,
+        )
+        if envs.WORKER_CONTROL_WS_ENABLED:
+            self._worker_control_client.set_command_executor(self._worker_command_executor)
+            self._create_async_task(self._worker_control_client.start())
+        else:
+            logger.info(
+                "Worker control rollout mode is legacy_only, outbound websocket control is disabled."
+            )
         if self._exporter_enabled:
             # Start the runtime metrics cacher.
             _runtime_metrics_aggregator = RuntimeMetricsAggregator(
@@ -296,11 +351,7 @@ class Worker:
         self._create_async_task(self._serve_manager.watch_model_instances_event())
         self._create_async_task(self._serve_manager.watch_model_instances())
         self._create_async_task(self._benchmark_manager.watch_benchmarks_event())
-
-        model_file_manager = ModelFileManager(
-            worker_id=self._worker_id, clientset=self._clientset, cfg=self._config
-        )
-        self._create_async_task(model_file_manager.watch_model_files())
+        self._create_async_task(self._model_file_manager.watch_model_files())
 
         # Start Kubernetes Device Plugin server if allowed.
         if get_resource_injection_policy() == "kdp":
@@ -313,6 +364,7 @@ class Worker:
 
             await asyncio.gather(*self._async_tasks)
         finally:
+            await self._worker_control_client.stop()
             self._serve_manager.reconcile_stale_direct_process_registry()
 
     async def _serve_apis(self):
@@ -340,7 +392,7 @@ class Worker:
             lifespan=lifespan,
         )
         app.state.config = self._config
-        app.state.token = read_worker_token(self._config.data_dir)
+        app.state.token = read_worker_token(cast(str, self._config.data_dir))
         app.state.worker_ip_getter = self.worker_ip
         app.state.get_instance_port_by_model_instance_id = (
             self._serve_manager.get_instance_port_by_model_instance_id
@@ -406,9 +458,9 @@ class Worker:
 
             # detect_ifname may be None if the hostname resolves to a loopback address.
             # This typically happens when the worker and server run on the same host, or for embedded workers.
-            detected_ifname = get_ifname_by_ip_hostname(
-                urlparse(self._config.get_server_url()).hostname
-            )
+            hostname = urlparse(self._config.get_server_url()).hostname
+            if hostname is not None:
+                detected_ifname = get_ifname_by_ip_hostname(hostname)
 
             try:
                 # if the expected_ifname is none, it will scan all interfaces
@@ -488,8 +540,9 @@ def migrate_worker_name(cfg: Config):
 
     In the end, we can generate the worker_name file based on the existance of the worker_token file and the worker_name configuration.
     """
-    worker_name_file = os.path.join(cfg.data_dir, "worker_name")
-    worker_token_file = os.path.join(cfg.data_dir, "worker_token")
+    data_dir = cast(str, cfg.data_dir)
+    worker_name_file = os.path.join(data_dir, "worker_name")
+    worker_token_file = os.path.join(data_dir, "worker_token")
     if not os.path.exists(worker_name_file) and os.path.exists(worker_token_file):
         if cfg.worker_name:
             with open(worker_name_file, "w") as f:
