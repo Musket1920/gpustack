@@ -1,12 +1,12 @@
 import asyncio
 import json
 import logging
-from typing import Dict
+from typing import Dict, Optional
 
 import aiohttp
 from gpustack.schemas.filesystem import FileExistsResponse
 from gpustack.schemas.models import Model
-from gpustack.schemas.workers import Worker
+from gpustack.schemas.workers import Worker, WorkerReachabilityModeEnum
 from gpustack.utils.network import use_proxy_env_for_url
 from gpustack import envs
 
@@ -14,6 +14,38 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = 15
 _GGUF_PARSE_TIMEOUT = 90
+
+
+class WorkerReverseHTTPUnsupportedError(aiohttp.ClientError):
+    pass
+
+
+def get_reverse_http_unavailable_message(
+    worker: Worker,
+    operation: str,
+) -> Optional[str]:
+    capabilities = worker.capabilities
+    if capabilities is not None and capabilities.reverse_http:
+        return None
+
+    if capabilities is None and (
+        worker.reachability_mode != WorkerReachabilityModeEnum.OUTBOUND_CONTROL_WS
+    ):
+        return None
+
+    reachability_mode = worker.reachability_mode
+    mode = reachability_mode.value if reachability_mode is not None else "unknown"
+    return (
+        f"Worker '{worker.name}' is in reachability mode '{mode}', so reverse-http "
+        f"is not available for {operation}. This reverse-only server-to-worker "
+        "operation is unsupported for outbound-control-only/NAT workers."
+    )
+
+
+def ensure_worker_reverse_http_available(worker: Worker, operation: str) -> None:
+    message = get_reverse_http_unavailable_message(worker, operation)
+    if message is not None:
+        raise WorkerReverseHTTPUnsupportedError(message)
 
 
 class WorkerFilesystemClient:
@@ -59,6 +91,7 @@ class WorkerFilesystemClient:
         Returns:
             Parsed config as dict
         """
+        ensure_worker_reverse_http_available(worker, "reading worker model config")
         url = f"http://{worker.advertise_address or worker.ip}:{worker.port}/files/model-config"
         params = {"path": path}
         headers = {"Authorization": f"Bearer {worker.token}"}
@@ -103,6 +136,9 @@ class WorkerFilesystemClient:
         Returns:
             FileExistsResponse indicating if the path exists
         """
+        ensure_worker_reverse_http_available(
+            worker, "checking worker filesystem paths"
+        )
         url = f"http://{worker.advertise_address or worker.ip}:{worker.port}/files/file-exists"
         params = {"path": path}
         headers = {"Authorization": f"Bearer {worker.token}"}
@@ -147,6 +183,9 @@ class WorkerFilesystemClient:
         Returns:
             The total size in bytes
         """
+        ensure_worker_reverse_http_available(
+            worker, "reading worker model weight size"
+        )
         url = f"http://{worker.advertise_address or worker.ip}:{worker.port}/files/model-weight-size"
         params = {"path": path}
         headers = {"Authorization": f"Bearer {worker.token}"}
@@ -200,6 +239,7 @@ class WorkerFilesystemClient:
         Raises:
             aiohttp.ClientError: If the request fails
         """
+        ensure_worker_reverse_http_available(worker, "parsing GGUF files on the worker")
         url = f"http://{worker.advertise_address or worker.ip}:{worker.port}/files/parse-gguf"
         headers = {"Authorization": f"Bearer {worker.token}"}
 

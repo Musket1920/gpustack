@@ -1,5 +1,6 @@
 from typing import Optional
 import aiohttp
+import logging
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import PlainTextResponse, StreamingResponse, RedirectResponse
 from urllib.parse import urlencode
@@ -7,10 +8,14 @@ from sqlalchemy.orm import selectinload
 
 from gpustack.api.responses import StreamingResponseWithStatusCode
 from gpustack import envs
+from gpustack.client.worker_filesystem_client import (
+    get_reverse_http_unavailable_message,
+)
 from gpustack.server.services import ModelInstanceService
 from gpustack.utils.network import use_proxy_env_for_url
 from gpustack.worker.logs import LogOptionsDep
 from gpustack.api.exceptions import (
+    ConflictException,
     InternalServerErrorException,
     NotFoundException,
 )
@@ -18,6 +23,10 @@ from gpustack.schemas.workers import Worker
 from gpustack.schemas.clusters import Cluster
 from gpustack.server.db import async_session
 from gpustack.server.deps import ListParamsDep, SessionDep
+from gpustack.server.worker_control_observability import (
+    control_log_extra,
+    record_capability_route_reject,
+)
 from gpustack.schemas.models import (
     ModelInstance,
     ModelInstanceCreate,
@@ -31,6 +40,7 @@ from gpustack.config.config import get_global_config
 from gpustack.utils.grafana import resolve_grafana_base_url
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("", response_model=ModelInstancesPublic)
@@ -139,6 +149,27 @@ async def get_serving_logs(  # noqa: C901
 ):
     model_instance = await fetch_model_instance(session, id)
     worker = await fetch_worker(session, model_instance.worker_id)
+    reverse_http_unavailable_message = get_reverse_http_unavailable_message(
+        worker,
+        "streaming serving logs",
+    )
+    if reverse_http_unavailable_message is not None:
+        worker_id = worker.id or 0
+        reachability_mode = (
+            worker.reachability_mode.value
+            if worker.reachability_mode is not None
+            else "unknown"
+        )
+        record_capability_route_reject(
+            worker_id=worker_id,
+            operation="streaming serving logs",
+            reachability_mode=reachability_mode,
+        )
+        logger.warning(
+            "Rejected reverse-only worker route because reverse-http is unavailable.",
+            extra=control_log_extra(worker_id=worker_id),
+        )
+        raise ConflictException(message=reverse_http_unavailable_message)
 
     model_instance_log_url = (
         f"http://{worker.advertise_address}:{worker.port}/serveLogs"

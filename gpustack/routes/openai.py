@@ -14,6 +14,7 @@ from starlette.datastructures import UploadFile
 
 from gpustack.api.exceptions import (
     BadRequestException,
+    ConflictException,
     NotFoundException,
     InternalServerErrorException,
     OpenAIAPIError,
@@ -23,6 +24,9 @@ from gpustack.api.exceptions import (
 )
 from gpustack.api.responses import StreamingResponseWithStatusCode
 from gpustack import envs
+from gpustack.client.worker_filesystem_client import (
+    get_reverse_http_unavailable_message,
+)
 from gpustack.http_proxy.load_balancer import LoadBalancer
 from gpustack.routes.model_common import build_category_conditions
 from gpustack.schemas.models import (
@@ -39,6 +43,10 @@ from gpustack.server.services import (
     ModelRouteService,
     WorkerService,
     UserService,
+)
+from gpustack.server.worker_control_observability import (
+    control_log_extra,
+    record_capability_route_reject,
 )
 from gpustack.utils.network import use_proxy_env_for_url
 
@@ -138,6 +146,32 @@ async def proxy_request_by_model(
             message=f"Worker with ID {instance.worker_id} not found",
             is_openai_exception=True,
         )
+
+    if model.backend != BackendEnum.ASCEND_MINDIE:
+        reverse_http_unavailable_message = get_reverse_http_unavailable_message(
+            worker,
+            "proxying OpenAI-compatible requests",
+        )
+        if reverse_http_unavailable_message is not None:
+            worker_id = worker.id or 0
+            reachability_mode = (
+                worker.reachability_mode.value
+                if worker.reachability_mode is not None
+                else "unknown"
+            )
+            record_capability_route_reject(
+                worker_id=worker_id,
+                operation="proxying OpenAI-compatible requests",
+                reachability_mode=reachability_mode,
+            )
+            logger.warning(
+                "Rejected reverse-only OpenAI route because reverse-http is unavailable.",
+                extra=control_log_extra(worker_id=worker_id),
+            )
+            raise ConflictException(
+                message=reverse_http_unavailable_message,
+                is_openai_exception=True,
+            )
 
     url = f"http://{instance.worker_ip}:{worker.port}/proxy/v1/{endpoint}"
     token = worker.token

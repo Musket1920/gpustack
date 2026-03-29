@@ -1,4 +1,5 @@
 from sqlmodel import col
+import logging
 import yaml
 from typing import Optional, Sequence
 import aiohttp
@@ -11,8 +12,12 @@ from gpustack.api.exceptions import (
     InternalServerErrorException,
     NotFoundException,
     BadRequestException,
+    ConflictException,
 )
 from gpustack.api.responses import StreamingResponseWithStatusCode
+from gpustack.client.worker_filesystem_client import (
+    get_reverse_http_unavailable_message,
+)
 from gpustack.schemas.models import (
     Model,
     ModelInstance,
@@ -44,6 +49,10 @@ from gpustack.schemas.benchmark import (
 from gpustack.server.services import (
     WorkerService,
 )
+from gpustack.server.worker_control_observability import (
+    control_log_extra,
+    record_capability_route_reject,
+)
 from gpustack.utils.gpu import summary_gpu_snapshots
 from gpustack.utils.network import use_proxy_env_for_url
 from gpustack.utils.snapshot import (
@@ -56,6 +65,7 @@ from sqlalchemy.orm import defer
 MAX_EXPORT_RECORDS = 20
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("", response_model=BenchmarksPublic)
@@ -384,6 +394,28 @@ async def get_benchmark_logs(  # noqa: C901
     worker = await Worker.one_by_id(session, benchmark.worker_id)
     if not worker:
         raise NotFoundException(message="Benchmark's worker not found")
+
+    reverse_http_unavailable_message = get_reverse_http_unavailable_message(
+        worker,
+        "streaming benchmark logs",
+    )
+    if reverse_http_unavailable_message is not None:
+        worker_id = worker.id or 0
+        reachability_mode = (
+            worker.reachability_mode.value
+            if worker.reachability_mode is not None
+            else "unknown"
+        )
+        record_capability_route_reject(
+            worker_id=worker_id,
+            operation="streaming benchmark logs",
+            reachability_mode=reachability_mode,
+        )
+        logger.warning(
+            "Rejected reverse-only benchmark route because reverse-http is unavailable.",
+            extra=control_log_extra(worker_id=worker_id),
+        )
+        raise ConflictException(message=reverse_http_unavailable_message)
 
     if benchmark.state in [
         BenchmarkStateEnum.ERROR,
