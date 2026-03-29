@@ -55,6 +55,63 @@ WORKER_UNREACHABLE_CHECK_MODE = os.getenv(
     "GPUSTACK_WORKER_UNREACHABLE_CHECK_MODE", "auto"
 ).lower()
 
+
+def _normalize_worker_control_rollout_mode(value: str | None) -> str:
+    normalized = (value or "hybrid").strip().lower().replace("-", "_")
+    aliases = {
+        "legacy": "legacy_only",
+        "legacy_only": "legacy_only",
+        "hybrid": "hybrid",
+        "ws": "ws_preferred",
+        "ws_preferred": "ws_preferred",
+        "outbound_control_ws": "ws_preferred",
+    }
+    return aliases.get(normalized, "hybrid")
+
+
+WORKER_CONTROL_ROLLOUT_MODE = _normalize_worker_control_rollout_mode(
+    os.getenv("GPUSTACK_WORKER_CONTROL_ROLLOUT_MODE", "hybrid")
+)
+WORKER_CONTROL_WS_ENABLED = WORKER_CONTROL_ROLLOUT_MODE != "legacy_only"
+WORKER_REVERSE_HTTP_ENABLED = os.getenv(
+    "GPUSTACK_WORKER_REVERSE_HTTP_ENABLED", "true"
+).lower() in {"true", "1", "yes", "on"}
+
+_worker_default_reachability_mode = os.getenv("GPUSTACK_WORKER_DEFAULT_REACHABILITY_MODE")
+if _worker_default_reachability_mode is None:
+    if WORKER_CONTROL_ROLLOUT_MODE == "ws_preferred":
+        _worker_default_reachability_mode = "outbound_control_ws"
+    else:
+        _worker_default_reachability_mode = "reverse_probe"
+
+WORKER_DEFAULT_REACHABILITY_MODE = _worker_default_reachability_mode.lower()
+if not WORKER_CONTROL_WS_ENABLED:
+    WORKER_DEFAULT_REACHABILITY_MODE = "reverse_probe"
+WORKER_CONTROL_SESSION_TTL_SECONDS = int(
+    os.getenv("GPUSTACK_WORKER_CONTROL_SESSION_TTL_SECONDS", 300)
+)
+WORKER_CONTROL_COMMAND_TTL_SECONDS = int(
+    os.getenv("GPUSTACK_WORKER_CONTROL_COMMAND_TTL_SECONDS", 3600)
+)
+WORKER_CONTROL_WS_HEARTBEAT_TIMEOUT_SECONDS = int(
+    os.getenv("GPUSTACK_WORKER_CONTROL_WS_HEARTBEAT_TIMEOUT_SECONDS", 45)
+)
+WORKER_CONTROL_SESSION_LOSS_TIMEOUT_SECONDS = int(
+    os.getenv(
+        "GPUSTACK_WORKER_CONTROL_SESSION_LOSS_TIMEOUT_SECONDS",
+        str(WORKER_CONTROL_WS_HEARTBEAT_TIMEOUT_SECONDS),
+    )
+)
+WORKER_CONTROL_WS_MAX_MESSAGE_BYTES = int(
+    os.getenv("GPUSTACK_WORKER_CONTROL_WS_MAX_MESSAGE_BYTES", 65536)
+)
+WORKER_CONTROL_WS_RATE_LIMIT_MESSAGES = int(
+    os.getenv("GPUSTACK_WORKER_CONTROL_WS_RATE_LIMIT_MESSAGES", 60)
+)
+WORKER_CONTROL_WS_RATE_LIMIT_WINDOW_SECONDS = float(
+    os.getenv("GPUSTACK_WORKER_CONTROL_WS_RATE_LIMIT_WINDOW_SECONDS", 1)
+)
+
 # Model instance configuration
 MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD = int(
     os.getenv("GPUSTACK_MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD", 300)
