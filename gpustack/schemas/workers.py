@@ -421,6 +421,13 @@ class WorkerStatusStored(BaseModel):
 
         return self
 
+    def _is_reachability_mode_inferred(self) -> bool:
+        private_attrs = getattr(self, "__pydantic_private__", None)
+        if not private_attrs:
+            return False
+
+        return bool(private_attrs.get("_reachability_mode_inferred", False))
+
 
 class WorkerStatusPublic(WorkerStatusStored):
     gateway_endpoint: Optional[str] = None
@@ -452,7 +459,7 @@ class WorkerCreate(WorkerStatusStored, WorkerUpdate):
         data = super().model_dump(*args, **kwargs)
         if self.capabilities is None:
             data.pop("capabilities", None)
-        if self._reachability_mode_inferred:
+        if self._is_reachability_mode_inferred():
             data.pop("reachability_mode", None)
         return data
 

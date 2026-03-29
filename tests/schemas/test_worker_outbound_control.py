@@ -88,6 +88,27 @@ def test_persisted_outbound_capable_worker_preserves_stored_reachability_mode(
     assert revalidated_worker.reachability_mode == WorkerReachabilityModeEnum.REVERSE_PROBE
 
 
+def test_db_loaded_worker_dump_without_private_attr_preserves_stored_reachability_mode():
+    worker = WorkerCreate.model_construct(
+        name="worker-db-loaded",
+        labels={"env": "test"},
+        hostname="worker-host",
+        ip="192.168.1.10",
+        ifname="eth0",
+        port=8080,
+        worker_uuid="worker-uuid",
+        cluster_id=1,
+        status=WorkerStatus.get_default_status(),
+        system_reserved=SystemReserved(ram=0, vram=0),
+        reachability_mode=WorkerReachabilityModeEnum.REVERSE_PROBE,
+    )
+    object.__delattr__(worker, "__pydantic_private__")
+
+    dumped = worker.model_dump()
+
+    assert dumped["reachability_mode"] == WorkerReachabilityModeEnum.REVERSE_PROBE
+
+
 def test_invalid_reachability_mode_requires_explicit_capability():
     with pytest.raises(ValidationError):
         _worker_create(reachability_mode=WorkerReachabilityModeEnum.OUTBOUND_CONTROL_WS)
