@@ -32,6 +32,7 @@ from gpustack.routes import (
     model_routes,
     grafana,
     prometheus,
+    worker_control,
 )
 
 from gpustack.api.exceptions import error_responses, openai_api_error_responses
@@ -194,6 +195,7 @@ api_router.include_router(
     dependencies=[Depends(get_worker_user)],
     prefix=versioned_prefix,
 )
+api_router.include_router(worker_control.router, prefix=versioned_prefix)
 api_router.include_router(
     cluster_client_router,
     dependencies=[Depends(get_cluster_user)],
