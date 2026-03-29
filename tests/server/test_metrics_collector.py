@@ -1,4 +1,14 @@
 from gpustack.server.metrics_collector import parse_token_metrics, ModelUsageMetrics
+from gpustack.server.worker_control import WorkerControlSessionRegistry
+from gpustack.server.worker_control_observability import (
+    reset_control_observability_metrics_for_tests,
+    worker_control_active_sessions,
+    worker_control_session_connections_total,
+    worker_control_session_disconnects_total,
+    worker_control_session_replacements_total,
+)
+
+import pytest
 
 # Example Prometheus metrics text
 METRICS_TEXT = '''
@@ -69,3 +79,50 @@ route_upstream_model_consumer_metric_llm_duration_count{ai_route="ai-route-model
     assert m3.request_count == 7
     assert m3.user_id == 4
     assert m3.access_key == "xyz123"
+
+
+class _FakeWebSocket:
+    def __init__(self):
+        self.close_calls = []
+
+    async def close(self, code: int, reason: str):
+        self.close_calls.append({"code": code, "reason": reason})
+
+
+@pytest.mark.asyncio
+async def test_worker_control_session_metrics_track_connections_and_replacements():
+    reset_control_observability_metrics_for_tests()
+    registry = WorkerControlSessionRegistry()
+
+    await registry.register(
+        worker_id=7,
+        worker_uuid="worker-7",
+        websocket=_FakeWebSocket(),
+        session_id="session-a",
+    )
+    await registry.register(
+        worker_id=7,
+        worker_uuid="worker-7",
+        websocket=_FakeWebSocket(),
+        session_id="session-b",
+    )
+    await registry.unregister(worker_id=7, generation=2, reason="websocket_disconnect")
+
+    assert (
+        worker_control_active_sessions.labels(worker_id="7")._value.get() == 0
+    )
+    assert (
+        worker_control_session_connections_total.labels(
+            worker_id="7",
+            control_channel="outbound_control_ws",
+        )._value.get()
+        == 2
+    )
+    assert worker_control_session_replacements_total.labels(worker_id="7")._value.get() == 1
+    assert (
+        worker_control_session_disconnects_total.labels(
+            worker_id="7",
+            reason="websocket_disconnect",
+        )._value.get()
+        == 1
+    )
