@@ -1,12 +1,17 @@
 import asyncio
 import datetime
 import logging
-from typing import Dict, Set
+from typing import Any, Dict, List, Set, cast
 
+import sqlalchemy as sa
 from sqlalchemy import update
 
 from gpustack.schemas.workers import Worker
 from gpustack.server.db import async_session
+from gpustack.server.worker_reachability import (
+    evaluate_worker_reachability,
+    fetch_active_control_sessions_by_worker_id,
+)
 from gpustack.server.services import WorkerService
 
 logger = logging.getLogger(__name__)
@@ -42,10 +47,11 @@ async def flush_heartbeats():
             heartbeat_time = datetime.datetime.now(datetime.timezone.utc).replace(
                 microsecond=0
             )
+            worker_id_column = cast(Any, sa.inspect(cast(Any, Worker)).c.id)
 
             stmt = (
                 update(Worker)
-                .where(Worker.id.in_(local_buffer))
+                .where(worker_id_column.in_(local_buffer))
                 .values(heartbeat_time=heartbeat_time)
             )
 
@@ -71,16 +77,29 @@ async def flush_worker_status():
     try:
         async with async_session() as session:
             # Query workers by ids
+            worker_id_column = cast(Any, sa.inspect(cast(Any, Worker)).c.id)
             workers = await Worker.all_by_fields(
-                session=session, extra_conditions=[Worker.id.in_(to_update_worker_ids)]
+                session=session,
+                extra_conditions=[worker_id_column.in_(to_update_worker_ids)],
+            )
+            active_control_sessions = await fetch_active_control_sessions_by_worker_id(
+                session,
+                to_update_worker_ids,
             )
 
-            for worker in workers:
-                for key, value in to_update_worker_status.get(worker.id, {}).items():
+            typed_workers: List[Worker] = list(workers)
+
+            for worker in typed_workers:
+                worker_id = worker.id
+                if worker_id is None:
+                    continue
+                for key, value in to_update_worker_status.get(worker_id, {}).items():
                     setattr(worker, key, value)
+                active_control_session = active_control_sessions.get(worker_id)
+                evaluate_worker_reachability(worker, active_control_session)
                 worker.compute_state()
 
-            await WorkerService(session).batch_update(workers)
+            await WorkerService(session).batch_update(typed_workers)
     except Exception as e:
         logger.error(f"Error flushing worker status to DB: {e}")
 

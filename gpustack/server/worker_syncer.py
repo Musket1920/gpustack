@@ -1,9 +1,13 @@
 import asyncio
 import logging
+from typing import Sequence
 
 from gpustack.schemas.workers import Worker, WorkerStateEnum
 from gpustack.server.db import async_session
-from gpustack.server.services import WorkerService
+from gpustack.server.worker_reachability import (
+    evaluate_worker_reachability,
+    fetch_active_control_sessions_by_worker_id,
+)
 from gpustack.utils.network import is_url_reachable
 from gpustack import envs
 
@@ -39,19 +43,44 @@ class WorkerSyncer:
         """
         async with async_session() as session:
             all_workers = await Worker.all(session)
+            worker_ids = [worker.id for worker in all_workers if worker.id is not None]
+            active_control_sessions = await fetch_active_control_sessions_by_worker_id(
+                session,
+                worker_ids,
+            )
 
         if not all_workers:
             return
 
-        if self._should_check_unreachable(len(all_workers)):
-            tasks = [
-                self._set_worker_unreachable(worker)
-                for worker in all_workers
-                if not worker.state.is_provisioning
-            ]
-            await asyncio.gather(*tasks)
+        original_worker_states = {
+            worker.id: (worker.unreachable, worker.state, worker.state_message)
+            for worker in all_workers
+        }
 
-        state_changed_workers = self.filter_state_change_workers(all_workers)
+        should_check_unreachable = self._should_check_unreachable(len(all_workers))
+        tasks = []
+        for worker in all_workers:
+            if worker.state.is_provisioning:
+                continue
+            worker_id = worker.id
+            active_control_session = (
+                active_control_sessions.get(worker_id)
+                if worker_id is not None
+                else None
+            )
+            tasks.append(
+                self._set_worker_unreachable(
+                    worker,
+                    active_control_session,
+                    should_check_unreachable=should_check_unreachable,
+                )
+            )
+        await asyncio.gather(*tasks)
+
+        state_changed_workers = self.filter_state_change_workers(
+            list(all_workers),
+            original_worker_states,
+        )
 
         should_update_workers = []
         state_to_worker_name = {
@@ -68,12 +97,15 @@ class WorkerSyncer:
         async with async_session() as session:
             for worker in should_update_workers:
                 # reload from DB and update states only
-                to_update_worker = await WorkerService(session).get_by_id(worker.id)
+                if worker.id is None:
+                    continue
+                to_update_worker = await Worker.one_by_id(session, worker.id)
                 if to_update_worker:
                     to_update_worker.unreachable = worker.unreachable
                     to_update_worker.state = worker.state
                     to_update_worker.state_message = worker.state_message
-                    await WorkerService(session).update(to_update_worker)
+                    session.add(to_update_worker)
+            await session.commit()
 
         for state, worker_names in state_to_worker_name.items():
             if worker_names:
@@ -107,11 +139,52 @@ class WorkerSyncer:
             # Default to auto behavior
             return worker_count <= auto_threshold
 
-    async def _set_worker_unreachable(self, worker: Worker):
-        worker.unreachable = not await self.is_worker_reachable(worker)
+    async def _set_worker_unreachable(
+        self,
+        worker: Worker,
+        active_control_session=None,
+        should_check_unreachable: bool = True,
+    ):
+        decision = evaluate_worker_reachability(worker, active_control_session)
+        if not decision.reverse_probe_required:
+            logger.info(
+                "Worker %s reverse probe %s",
+                worker.name,
+                decision.reverse_probe_reason,
+            )
+            return
+
+        if not should_check_unreachable:
+            logger.info(
+                "Worker %s reverse probe skipped: disabled_by_mode (%s)",
+                worker.name,
+                decision.reverse_probe_reason,
+            )
+            return
+
+        reachable = await self.is_worker_reachable(worker)
+        worker.unreachable = not reachable
+
+        probe_state = "applied" if reachable else "failed"
+        if decision.transport_timed_out and decision.transport_message:
+            worker.state = WorkerStateEnum.NOT_READY
+            worker.state_message = (
+                f"{decision.transport_message} Reverse probe {probe_state} for this worker."
+            )
+
+        logger.info(
+            "Worker %s reverse probe %s (%s)",
+            worker.name,
+            probe_state,
+            decision.reverse_probe_reason,
+        )
 
     @staticmethod
-    def filter_state_change_workers(workers: list[Worker]) -> list[Worker]:
+    def filter_state_change_workers(
+        workers: Sequence[Worker],
+        original_worker_states: dict[int | None, tuple[bool, WorkerStateEnum, str | None]]
+        | None = None,
+    ) -> list[Worker]:
         """
         Filter workers whose state has changed.
 
@@ -123,13 +196,25 @@ class WorkerSyncer:
         """
         state_changed_workers = []
         for worker in workers:
-            original_worker_state = worker.state
-            original_worker_state_message = worker.state_message
+            if original_worker_states is not None:
+                (
+                    original_worker_unreachable,
+                    original_worker_state,
+                    original_worker_state_message,
+                ) = original_worker_states.get(
+                    worker.id,
+                    (worker.unreachable, worker.state, worker.state_message),
+                )
+            else:
+                original_worker_unreachable = worker.unreachable
+                original_worker_state = worker.state
+                original_worker_state_message = worker.state_message
 
             worker.compute_state()
 
             if (
-                worker.state != original_worker_state
+                worker.unreachable != original_worker_unreachable
+                or worker.state != original_worker_state
                 or worker.state_message != original_worker_state_message
             ):
                 state_changed_workers.append(worker)
