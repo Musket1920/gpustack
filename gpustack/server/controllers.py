@@ -975,6 +975,18 @@ class WorkerController:
                     )
                 return
 
+            if not worker.uses_legacy_unreachable_instance_coupling():
+                if worker.state == WorkerStateEnum.READY:
+                    await self.update_instance_states(
+                        session,
+                        instances,
+                        ModelInstanceStateEnum.UNREACHABLE,
+                        ModelInstanceStateEnum.RUNNING,
+                        "",
+                        "worker is ready",
+                    )
+                return
+
             if (
                 worker.unreachable
                 or worker.state == WorkerStateEnum.UNREACHABLE

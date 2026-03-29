@@ -43,6 +43,9 @@ class WorkerInstanceCleaner:
 
             offline_worker_names = {}
             for worker in workers:
+                if not worker.uses_legacy_unreachable_instance_coupling():
+                    continue
+
                 if worker.state == WorkerStateEnum.NOT_READY and (
                     not worker.maintenance or not worker.maintenance.enabled
                 ):
@@ -61,7 +64,7 @@ class WorkerInstanceCleaner:
                     continue
 
                 instance_names = await ModelInstanceService(session).batch_delete(
-                    instances
+                    list(instances)
                 )
 
                 reschedule_minutes = envs.MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD / 60

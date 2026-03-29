@@ -51,6 +51,10 @@ from gpustack.schemas.models import (
 from gpustack.schemas.model_files import ModelFileStateEnum
 from gpustack.server.bus import EventType
 from gpustack.server.db import async_session
+from gpustack.server.worker_reachability import (
+    evaluate_worker_reachability,
+    fetch_active_control_sessions_by_worker_id,
+)
 from gpustack.scheduler.calculator import (
     GPUOffloadEnum,
     calculate_gguf_model_resource_claim,
@@ -414,6 +418,8 @@ async def find_candidate(
                 - A list of messages for the scheduling process.
     """
 
+    workers = await _prepare_workers_for_new_placements(workers)
+
     # Filter workers.
     filters = [
         ClusterFilter(model),
@@ -514,6 +520,32 @@ async def find_candidate(
 
     # Return the candidate and messages.
     return candidate, messages
+
+
+async def _prepare_workers_for_new_placements(workers: List[Worker]) -> List[Worker]:
+    worker_ids = [worker.id for worker in workers if worker.id is not None]
+    active_control_sessions = {}
+    if worker_ids:
+        async with async_session() as session:
+            active_control_sessions = await fetch_active_control_sessions_by_worker_id(
+                session,
+                worker_ids,
+            )
+
+    for worker in workers:
+        if worker.state.is_provisioning:
+            continue
+
+        active_control_session = (
+            active_control_sessions.get(worker.id)
+            if worker.id is not None
+            else None
+        )
+        decision = evaluate_worker_reachability(worker, active_control_session)
+        if decision.active_control_session is not None:
+            worker.compute_state()
+
+    return [worker for worker in workers if not worker.should_block_new_placements()]
 
 
 def _filter_unsupported_direct_process_candidates(
