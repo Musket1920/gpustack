@@ -4,7 +4,7 @@ import base64
 import uuid
 import logging
 import asyncio
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, cast
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from urllib.parse import urlencode
@@ -30,6 +30,9 @@ from gpustack.server.worker_status_buffer import (
     worker_status_flush_buffer,
     worker_status_flush_buffer_lock,
 )
+from gpustack.server.worker_reachability import (
+    fetch_active_control_sessions_by_worker_id,
+)
 from gpustack.schemas.workers import (
     WorkerCreate,
     WorkerListParams,
@@ -38,6 +41,7 @@ from gpustack.schemas.workers import (
     WorkersPublic,
     Worker,
     WorkerRegistrationPublic,
+    WorkerSession,
     WorkerStatusStored,
     WorkerStateEnum,
 )
@@ -52,6 +56,9 @@ from gpustack.security import get_secret_hash, API_KEY_PREFIX
 from gpustack.server.services import WorkerService
 from gpustack.cloud_providers.common import key_bytes_to_openssh_pem
 from gpustack.utils.grafana import resolve_grafana_base_url
+from gpustack.client.worker_filesystem_client import (
+    get_reverse_http_unavailable_message,
+)
 
 router = APIRouter()
 system_name_prefix = "system/worker"
@@ -63,8 +70,27 @@ logger = logging.getLogger(__name__)
 create_worker_semaphore = asyncio.Semaphore(10)
 
 
-def to_worker_public(input: Worker, me: bool) -> WorkerPublic:
+async def load_active_control_sessions(
+    session: AsyncSession,
+    worker_ids: List[int],
+) -> Dict[int, WorkerSession]:
+    return await fetch_active_control_sessions_by_worker_id(session, worker_ids)
+
+
+def to_worker_public(
+    input: Worker,
+    me: bool,
+    active_session: Optional[WorkerSession] = None,
+) -> WorkerPublic:
+    input.set_active_control_session(active_session)
     data = input.model_dump()
+    data["health"] = input.health_status.model_dump()
+    reverse_http_unavailable_message = get_reverse_http_unavailable_message(
+        input,
+        "reverse-only server-to-worker actions",
+    )
+    data["reverse_http_available"] = reverse_http_unavailable_message is None
+    data["reverse_http_unavailable_message"] = reverse_http_unavailable_message
     if me:
         data['me'] = me
     return WorkerPublic.model_validate(data)
@@ -84,7 +110,7 @@ async def get_workers(
     if search:
         fuzzy_fields = {"name": search}
 
-    fields = {}
+    fields: Dict[str, Any] = {}
     if name:
         fields = {"name": name}
     if uuid:
@@ -122,11 +148,34 @@ async def get_workers(
             per_page=params.perPage,
             order_by=order_by,
         )
+        worker_items = [cast(Worker, worker) for worker in worker_list.items]
+        worker_item_ids = [worker.id for worker in worker_items if worker.id is not None]
+        active_sessions_by_worker_id = await load_active_control_sessions(
+            session,
+            cast(List[int], worker_item_ids),
+        )
         if not user.worker:
-            return worker_list
+            public_list = []
+            for worker in worker_items:
+                worker_id = cast(int, worker.id)
+                public_list.append(
+                    to_worker_public(
+                        worker,
+                        False,
+                        active_sessions_by_worker_id.get(worker_id),
+                    )
+                )
+            return WorkersPublic(items=public_list, pagination=worker_list.pagination)
         public_list = []
-        for worker in worker_list.items:
-            public_list.append(to_worker_public(worker, user.worker.id == worker.id))
+        for worker in worker_items:
+            worker_id = cast(int, worker.id)
+            public_list.append(
+                to_worker_public(
+                    worker,
+                    user.worker.id == worker_id,
+                    active_sessions_by_worker_id.get(worker_id),
+                )
+            )
         return WorkersPublic(items=public_list, pagination=worker_list.pagination)
 
 
@@ -139,9 +188,11 @@ async def get_worker(
     worker = await Worker.one_by_id(session, id)
     if not worker:
         raise NotFoundException(message="worker not found")
+    worker_id = cast(int, worker.id)
+    active_sessions_by_worker_id = await load_active_control_sessions(session, [worker_id])
     if user.worker is not None and user.worker.id == worker.id:
-        return to_worker_public(worker, True)
-    return worker
+        return to_worker_public(worker, True, active_sessions_by_worker_id.get(worker_id))
+    return to_worker_public(worker, False, active_sessions_by_worker_id.get(worker_id))
 
 
 @router.get("/{id}/dashboard")
@@ -539,7 +590,9 @@ async def update_worker(session: SessionDep, id: int, worker_in: WorkerUpdate):
     except Exception as e:
         raise InternalServerErrorException(message=f"Failed to update worker: {e}")
 
-    return worker
+    worker_id = cast(int, worker.id)
+    active_sessions_by_worker_id = await load_active_control_sessions(session, [worker_id])
+    return to_worker_public(worker, False, active_sessions_by_worker_id.get(worker_id))
 
 
 @router.delete("/{id}")
